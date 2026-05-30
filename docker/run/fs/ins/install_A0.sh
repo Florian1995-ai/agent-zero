@@ -34,8 +34,12 @@ fi
 # # Install some packages in specific variants
 # pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-# Install remaining A0 python packages
-uv pip install -r /git/agent-zero/requirements.txt
+# Install remaining A0 python packages.
+# openai-whisper==20240930 imports pkg_resources during its wheel build but
+# does not declare setuptools as a build dependency, so keep that package out
+# of uv's isolated build environment after ensuring setuptools is installed.
+uv pip install setuptools wheel
+uv pip install --no-build-isolation-package openai-whisper -r /git/agent-zero/requirements.txt
 # override for packages that have unnecessarily strict dependencies
 uv pip install -r /git/agent-zero/requirements2.txt
 
