@@ -3,6 +3,7 @@ set -e
 
 # update apt
 apt-get update
+apt-get install -y --no-install-recommends build-essential cmake pkg-config
 
 # fix permissions for cron files if any
 if [ -f /etc/cron.d/* ]; then
