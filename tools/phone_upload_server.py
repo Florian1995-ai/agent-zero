@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import cgi
 import html
+import json
 import os
 import shutil
 from datetime import datetime
@@ -105,6 +106,46 @@ def page(message: str = "") -> bytes:
       font-weight: 800;
       font-size: 16px;
     }}
+    button:disabled {{
+      opacity: 0.55;
+    }}
+    .progress-wrap {{
+      display: none;
+      margin-top: 18px;
+    }}
+    .progress-meta {{
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      margin-bottom: 8px;
+      color: #f7f7f7;
+      font-weight: 800;
+    }}
+    .progress-track {{
+      height: 16px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: #2b2b2b;
+      border: 1px solid #444;
+    }}
+    .progress-bar {{
+      width: 0%;
+      height: 100%;
+      background: #ffd400;
+      transition: width 0.18s ease;
+    }}
+    .status {{
+      min-height: 22px;
+      margin-top: 10px;
+      color: #cfcfcf;
+      font-weight: 700;
+    }}
+    .status.ok {{
+      color: #5af28a;
+    }}
+    .status.error {{
+      color: #ff6464;
+    }}
     table {{
       width: 100%;
       border-collapse: collapse;
@@ -134,9 +175,19 @@ def page(message: str = "") -> bytes:
     <p>Upload one iPhone clip. The file will be saved into Agent Zero's mounted assets folder.</p>
     <p class="path">{html.escape(str(UPLOAD_DIR))}</p>
     {message_html}
-    <form method="post" enctype="multipart/form-data">
-      <input type="file" name="video" accept="video/*" required>
-      <button type="submit">Upload Video</button>
+    <form id="upload-form" method="post" enctype="multipart/form-data">
+      <input id="video-input" type="file" name="video" accept="video/*" required>
+      <button id="upload-button" type="submit">Upload Video</button>
+      <div id="progress-wrap" class="progress-wrap" aria-live="polite">
+        <div class="progress-meta">
+          <span id="progress-label">Waiting</span>
+          <span id="progress-percent">0%</span>
+        </div>
+        <div class="progress-track">
+          <div id="progress-bar" class="progress-bar"></div>
+        </div>
+        <div id="upload-status" class="status"></div>
+      </div>
     </form>
     <h2>Recent Uploads</h2>
     <table>
@@ -144,6 +195,91 @@ def page(message: str = "") -> bytes:
       <tbody>{list_uploads()}</tbody>
     </table>
   </main>
+  <script>
+    const form = document.getElementById("upload-form");
+    const input = document.getElementById("video-input");
+    const button = document.getElementById("upload-button");
+    const progressWrap = document.getElementById("progress-wrap");
+    const progressBar = document.getElementById("progress-bar");
+    const progressPercent = document.getElementById("progress-percent");
+    const progressLabel = document.getElementById("progress-label");
+    const status = document.getElementById("upload-status");
+
+    function setProgress(percent, label) {{
+      const clean = Math.max(0, Math.min(100, Math.round(percent)));
+      progressWrap.style.display = "block";
+      progressBar.style.width = clean + "%";
+      progressPercent.textContent = clean + "%";
+      progressLabel.textContent = label;
+    }}
+
+    function setStatus(message, kind) {{
+      status.textContent = message;
+      status.className = "status" + (kind ? " " + kind : "");
+    }}
+
+    form.addEventListener("submit", (event) => {{
+      event.preventDefault();
+      if (!input.files || input.files.length === 0) {{
+        setStatus("Choose a video first.", "error");
+        return;
+      }}
+
+      const file = input.files[0];
+      const formData = new FormData();
+      formData.append("video", file);
+
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", window.location.href, true);
+      xhr.setRequestHeader("X-Requested-With", "XMLHttpRequest");
+
+      button.disabled = true;
+      input.disabled = true;
+      setProgress(0, "Uploading");
+      setStatus(file.name + " selected. Keep this page open.", "");
+
+      xhr.upload.addEventListener("progress", (event) => {{
+        if (event.lengthComputable) {{
+          setProgress((event.loaded / event.total) * 100, "Uploading");
+        }} else {{
+          progressWrap.style.display = "block";
+          progressLabel.textContent = "Uploading";
+          progressPercent.textContent = "Working...";
+        }}
+      }});
+
+      xhr.addEventListener("load", () => {{
+        if (xhr.status >= 200 && xhr.status < 300) {{
+          setProgress(100, "Uploaded");
+          try {{
+            const data = JSON.parse(xhr.responseText);
+            setStatus("Saved as " + data.filename + " (" + data.size_mb + " MB). Refreshing list...", "ok");
+          }} catch (_err) {{
+            setStatus("Upload complete. Refreshing list...", "ok");
+          }}
+          window.setTimeout(() => window.location.reload(), 1200);
+        }} else {{
+          setStatus("Upload failed with status " + xhr.status + ".", "error");
+          button.disabled = false;
+          input.disabled = false;
+        }}
+      }});
+
+      xhr.addEventListener("error", () => {{
+        setStatus("Upload failed. Check connection and try again.", "error");
+        button.disabled = false;
+        input.disabled = false;
+      }});
+
+      xhr.addEventListener("abort", () => {{
+        setStatus("Upload cancelled.", "error");
+        button.disabled = false;
+        input.disabled = false;
+      }});
+
+      xhr.send(formData);
+    }});
+  </script>
 </body>
 </html>"""
     return body.encode("utf-8")
@@ -184,6 +320,21 @@ class Handler(BaseHTTPRequestHandler):
         with partial.open("wb") as out_file:
             shutil.copyfileobj(field.file, out_file, length=1024 * 1024)
         partial.rename(destination)
+
+        if self.headers.get("X-Requested-With") == "XMLHttpRequest":
+            payload = json.dumps(
+                {
+                    "ok": True,
+                    "filename": filename,
+                    "size_mb": round(destination.stat().st_size / (1024 * 1024), 1),
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
 
         self.send_response(303)
         self.send_header("Location", f"/?uploaded={quote(filename)}")
