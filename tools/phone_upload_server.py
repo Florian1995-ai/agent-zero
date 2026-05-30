@@ -13,14 +13,19 @@ import html
 import json
 import os
 import shutil
+import subprocess
+import sys
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 
 UPLOAD_DIR = Path(os.getenv("AGENTZERO_UPLOAD_DIR", "/app/work_dir/assets/agentzero_uploads/shorts_test"))
+OUTPUT_ROOT = Path(os.getenv("AGENTZERO_OUTPUT_DIR", "/app/work_dir/assets/agentzero_outputs"))
+RENDER_STATUS_FILE = OUTPUT_ROOT / "render_status.json"
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm"}
+render_process: subprocess.Popen | None = None
 
 
 def safe_filename(filename: str) -> str:
@@ -51,8 +56,30 @@ def list_uploads() -> str:
     return "".join(rows) or "<tr><td colspan='2'>No uploads yet.</td></tr>"
 
 
+def read_render_status() -> dict:
+    if not RENDER_STATUS_FILE.exists():
+        return {"state": "idle"}
+    try:
+        return json.loads(RENDER_STATUS_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"state": "unknown", "error": str(exc)}
+
+
+def write_render_status(status: dict) -> None:
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    status["updated_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    tmp = RENDER_STATUS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(status, indent=2, ensure_ascii=True), encoding="utf-8")
+    tmp.replace(RENDER_STATUS_FILE)
+
+
 def page(message: str = "") -> bytes:
     message_html = f"<p class='message'>{html.escape(message)}</p>" if message else ""
+    render_status = read_render_status()
+    render_state = html.escape(str(render_status.get("state", "idle")))
+    render_step = html.escape(str(render_status.get("step", "")))
+    render_final = html.escape(str(render_status.get("final", "")))
+    render_thumbnail = html.escape(str(render_status.get("thumbnail", "")))
     body = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -146,6 +173,28 @@ def page(message: str = "") -> bytes:
     .status.error {{
       color: #ff6464;
     }}
+    .render-card {{
+      margin: 24px 0;
+      padding: 20px;
+      border: 1px solid #333;
+      border-radius: 8px;
+      background: #181818;
+    }}
+    .render-card button {{
+      background: #f7f7f7;
+      color: #111;
+    }}
+    .render-output {{
+      margin-top: 12px;
+      padding: 12px;
+      border-radius: 6px;
+      background: #0d0d0d;
+      color: #d8d8d8;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 13px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }}
     table {{
       width: 100%;
       border-collapse: collapse;
@@ -189,6 +238,15 @@ def page(message: str = "") -> bytes:
         <div id="upload-status" class="status"></div>
       </div>
     </form>
+    <section class="render-card">
+      <h2>Render Test</h2>
+      <p>Start a server-side render from the newest completed upload. Partial files are ignored and the selected file must pass ffprobe first.</p>
+      <button id="render-button" type="button">Render Latest Valid Upload</button>
+      <div id="render-output" class="render-output">State: {render_state}
+Step: {render_step}
+Final: {render_final}
+Thumbnail: {render_thumbnail}</div>
+    </section>
     <h2>Recent Uploads</h2>
     <table>
       <thead><tr><th>File</th><th>Size</th></tr></thead>
@@ -204,6 +262,8 @@ def page(message: str = "") -> bytes:
     const progressPercent = document.getElementById("progress-percent");
     const progressLabel = document.getElementById("progress-label");
     const status = document.getElementById("upload-status");
+    const renderButton = document.getElementById("render-button");
+    const renderOutput = document.getElementById("render-output");
 
     function setProgress(percent, label) {{
       const clean = Math.max(0, Math.min(100, Math.round(percent)));
@@ -279,6 +339,47 @@ def page(message: str = "") -> bytes:
 
       xhr.send(formData);
     }});
+
+    function renderStatusText(data) {{
+      const lines = [
+        "State: " + (data.state || "idle"),
+        "Step: " + (data.step || ""),
+        "Input: " + (data.input || ""),
+        "Final: " + (data.final || ""),
+        "Thumbnail: " + (data.thumbnail || ""),
+        "Duration: " + (data.duration || ""),
+        "Cuts: " + (data.cut_count || ""),
+        "Error: " + (data.error || "")
+      ];
+      return lines.join("\\n");
+    }}
+
+    async function loadRenderStatus() {{
+      try {{
+        const response = await fetch("/render-status", {{ cache: "no-store" }});
+        const data = await response.json();
+        renderOutput.textContent = renderStatusText(data);
+        renderButton.disabled = data.state === "running" || data.state === "queued";
+      }} catch (_err) {{
+        renderOutput.textContent = "Could not load render status.";
+      }}
+    }}
+
+    renderButton.addEventListener("click", async () => {{
+      renderButton.disabled = true;
+      renderOutput.textContent = "Starting server render...";
+      try {{
+        const response = await fetch("/render-latest", {{ method: "POST" }});
+        const data = await response.json();
+        renderOutput.textContent = renderStatusText(data);
+      }} catch (_err) {{
+        renderOutput.textContent = "Render start failed.";
+        renderButton.disabled = false;
+      }}
+    }});
+
+    window.setInterval(loadRenderStatus, 5000);
+    loadRenderStatus();
   </script>
 </body>
 </html>"""
@@ -287,6 +388,14 @@ def page(message: str = "") -> bytes:
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
+        path = urlparse(self.path).path
+        if path == "/render-status":
+            self.send_json(current_render_status())
+            return
+        if path not in ("", "/"):
+            self.send_error(404, "Not found")
+            return
+
         payload = page()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -295,6 +404,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_POST(self) -> None:
+        path = urlparse(self.path).path
+        if path == "/render-latest":
+            self.start_render()
+            return
+
         content_type = self.headers.get("content-type", "")
         if not content_type.startswith("multipart/form-data"):
             self.send_error(400, "Expected multipart/form-data")
@@ -340,8 +454,57 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Location", f"/?uploaded={quote(filename)}")
         self.end_headers()
 
+    def send_json(self, data: dict, status: int = 200) -> None:
+        payload = json.dumps(data, ensure_ascii=True).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def start_render(self) -> None:
+        global render_process
+        if render_process and render_process.poll() is None:
+            self.send_json(current_render_status() | {"ok": True, "message": "Render already running"}, 202)
+            return
+
+        OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+        log_path = OUTPUT_ROOT / "render-launch.log"
+        write_render_status(
+            {
+                "state": "queued",
+                "step": "launch",
+                "upload_dir": str(UPLOAD_DIR),
+                "output_root": str(OUTPUT_ROOT),
+                "log": str(log_path),
+            }
+        )
+
+        script = Path(__file__).with_name("phone_render_worker.py")
+        env = os.environ.copy()
+        log_file = log_path.open("ab", buffering=0)
+        render_process = subprocess.Popen(
+            [sys.executable, str(script)],
+            cwd=str(script.parent),
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env=env,
+            close_fds=True,
+        )
+        self.send_json(current_render_status() | {"ok": True, "pid": render_process.pid}, 202)
+
     def log_message(self, fmt: str, *args) -> None:
         print(f"[phone-upload] {self.address_string()} - {fmt % args}", flush=True)
+
+
+def current_render_status() -> dict:
+    status = read_render_status()
+    if render_process and render_process.poll() is None:
+        status["process"] = "running"
+    elif render_process:
+        status["process"] = "exited"
+        status["process_exit_code"] = render_process.poll()
+    return status
 
 
 def main() -> int:
