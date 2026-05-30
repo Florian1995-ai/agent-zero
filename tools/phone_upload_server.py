@@ -11,6 +11,7 @@ from __future__ import annotations
 import cgi
 import html
 import json
+import mimetypes
 import os
 import shutil
 import subprocess
@@ -18,7 +19,7 @@ import sys
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 
 UPLOAD_DIR = Path(os.getenv("AGENTZERO_UPLOAD_DIR", "/app/work_dir/assets/agentzero_uploads/shorts_test"))
@@ -73,6 +74,17 @@ def write_render_status(status: dict) -> None:
     tmp.replace(RENDER_STATUS_FILE)
 
 
+def output_url_for(path_value: str) -> str:
+    if not path_value:
+        return ""
+    try:
+        target = Path(path_value).resolve()
+        rel = target.relative_to(OUTPUT_ROOT.resolve())
+    except Exception:
+        return ""
+    return "/outputs/" + "/".join(quote(part) for part in rel.parts)
+
+
 def page(message: str = "") -> bytes:
     message_html = f"<p class='message'>{html.escape(message)}</p>" if message else ""
     render_status = read_render_status()
@@ -80,6 +92,8 @@ def page(message: str = "") -> bytes:
     render_step = html.escape(str(render_status.get("step", "")))
     render_final = html.escape(str(render_status.get("final", "")))
     render_thumbnail = html.escape(str(render_status.get("thumbnail", "")))
+    render_final_url = html.escape(output_url_for(str(render_status.get("final", ""))))
+    render_thumbnail_url = html.escape(output_url_for(str(render_status.get("thumbnail", ""))))
     body = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -184,6 +198,10 @@ def page(message: str = "") -> bytes:
       background: #f7f7f7;
       color: #111;
     }}
+    .render-card a {{
+      color: #ffd400;
+      font-weight: 800;
+    }}
     .render-output {{
       margin-top: 12px;
       padding: 12px;
@@ -246,6 +264,10 @@ def page(message: str = "") -> bytes:
 Step: {render_step}
 Final: {render_final}
 Thumbnail: {render_thumbnail}</div>
+      <p id="render-links">
+        {f'<a href="{render_final_url}" target="_blank">Open final.mp4</a>' if render_final_url else ''}
+        {f' &middot; <a href="{render_thumbnail_url}" target="_blank">Open thumbnail.jpg</a>' if render_thumbnail_url else ''}
+      </p>
     </section>
     <h2>Recent Uploads</h2>
     <table>
@@ -264,6 +286,7 @@ Thumbnail: {render_thumbnail}</div>
     const status = document.getElementById("upload-status");
     const renderButton = document.getElementById("render-button");
     const renderOutput = document.getElementById("render-output");
+    const renderLinks = document.getElementById("render-links");
 
     function setProgress(percent, label) {{
       const clean = Math.max(0, Math.min(100, Math.round(percent)));
@@ -354,11 +377,23 @@ Thumbnail: {render_thumbnail}</div>
       return lines.join("\\n");
     }}
 
+    function updateRenderLinks(data) {{
+      const links = [];
+      if (data.final_url) {{
+        links.push('<a href="' + data.final_url + '" target="_blank">Open final.mp4</a>');
+      }}
+      if (data.thumbnail_url) {{
+        links.push('<a href="' + data.thumbnail_url + '" target="_blank">Open thumbnail.jpg</a>');
+      }}
+      renderLinks.innerHTML = links.join(" &middot; ");
+    }}
+
     async function loadRenderStatus() {{
       try {{
         const response = await fetch("/render-status", {{ cache: "no-store" }});
         const data = await response.json();
         renderOutput.textContent = renderStatusText(data);
+        updateRenderLinks(data);
         renderButton.disabled = data.state === "running" || data.state === "queued";
       }} catch (_err) {{
         renderOutput.textContent = "Could not load render status.";
@@ -372,6 +407,7 @@ Thumbnail: {render_thumbnail}</div>
         const response = await fetch("/render-latest", {{ method: "POST" }});
         const data = await response.json();
         renderOutput.textContent = renderStatusText(data);
+        updateRenderLinks(data);
       }} catch (_err) {{
         renderOutput.textContent = "Render start failed.";
         renderButton.disabled = false;
@@ -391,6 +427,9 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/render-status":
             self.send_json(current_render_status())
+            return
+        if path.startswith("/outputs/"):
+            self.send_output(path)
             return
         if path not in ("", "/"):
             self.send_error(404, "Not found")
@@ -462,6 +501,65 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def send_output(self, request_path: str) -> None:
+        raw_rel = request_path.removeprefix("/outputs/").strip("/")
+        if not raw_rel:
+            self.send_error(404, "Missing output path")
+            return
+
+        rel_parts = [unquote(part) for part in raw_rel.split("/") if part]
+        target = (OUTPUT_ROOT / Path(*rel_parts)).resolve()
+        root = OUTPUT_ROOT.resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            self.send_error(403, "Invalid output path")
+            return
+        if not target.is_file():
+            self.send_error(404, "Output file not found")
+            return
+
+        total = target.stat().st_size
+        content_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        range_header = self.headers.get("Range", "")
+        start = 0
+        end = total - 1
+        status_code = 200
+
+        if range_header.startswith("bytes="):
+            try:
+                range_value = range_header.removeprefix("bytes=").split(",", 1)[0]
+                start_text, end_text = range_value.split("-", 1)
+                start = int(start_text) if start_text else 0
+                end = int(end_text) if end_text else total - 1
+                start = max(0, min(start, total - 1))
+                end = max(start, min(end, total - 1))
+                status_code = 206
+            except Exception:
+                start = 0
+                end = total - 1
+                status_code = 200
+
+        length = end - start + 1
+        self.send_response(status_code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Disposition", f'inline; filename="{target.name}"')
+        if status_code == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+        self.end_headers()
+
+        with target.open("rb") as file:
+            file.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = file.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
+
     def start_render(self) -> None:
         global render_process
         if render_process and render_process.poll() is None:
@@ -499,6 +597,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def current_render_status() -> dict:
     status = read_render_status()
+    if status.get("final"):
+        status["final_url"] = output_url_for(str(status["final"]))
+    if status.get("thumbnail"):
+        status["thumbnail_url"] = output_url_for(str(status["thumbnail"]))
     if render_process and render_process.poll() is None:
         status["process"] = "running"
     elif render_process:
