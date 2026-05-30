@@ -203,7 +203,7 @@ def parse_silences(stderr: str) -> list[tuple[float, float]]:
     return [(start, end) for start, end in zip(starts, ends) if end > start]
 
 
-def speech_segments(duration: float, silences: list[tuple[float, float]], padding: float = 0.05) -> list[tuple[float, float]]:
+def speech_segments(duration: float, silences: list[tuple[float, float]], padding: float = 0.035) -> list[tuple[float, float]]:
     if not silences:
         return [(0.0, duration)]
 
@@ -212,11 +212,11 @@ def speech_segments(duration: float, silences: list[tuple[float, float]], paddin
     for silence_start, silence_end in silences:
         start = cursor
         end = max(cursor, silence_start + padding)
-        if end - start >= 0.18:
+        if end - start >= 0.12:
             keep.append((start, min(duration, end)))
         cursor = max(cursor, silence_end - padding)
 
-    if duration - cursor >= 0.18:
+    if duration - cursor >= 0.12:
         keep.append((cursor, duration))
 
     if not keep:
@@ -232,7 +232,7 @@ def cut_silences(input_path: Path, output_path: Path, job_dir: Path) -> int:
             "-i",
             str(input_path),
             "-af",
-            "silencedetect=noise=-35dB:d=0.28",
+            "silencedetect=noise=-28dB:d=0.18",
             "-f",
             "null",
             "-",
