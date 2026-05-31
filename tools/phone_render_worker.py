@@ -224,38 +224,7 @@ def speech_segments(duration: float, silences: list[tuple[float, float]], paddin
     return keep
 
 
-def cut_silences(input_path: Path, output_path: Path, job_dir: Path) -> int:
-    detect = run(
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-i",
-            str(input_path),
-            "-af",
-            "silencedetect=noise=-28dB:d=0.18",
-            "-f",
-            "null",
-            "-",
-        ],
-        "detect-silence",
-        capture=True,
-    )
-    silences = parse_silences((detect.stderr or "") + "\n" + (detect.stdout or ""))
-    duration = ffprobe_duration(input_path)
-    segments = speech_segments(duration, silences)
-    (job_dir / "segments.json").write_text(
-        json.dumps(
-            {
-                "duration": duration,
-                "silences": silences,
-                "segments": segments,
-                "cut_count": max(0, len(segments) - 1),
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
+def render_segments(input_path: Path, output_path: Path, segments: list[tuple[float, float]], step: str) -> int:
     if len(segments) <= 1:
         shutil.copy2(input_path, output_path)
         return 0
@@ -294,9 +263,43 @@ def cut_silences(input_path: Path, output_path: Path, job_dir: Path) -> int:
             "+faststart",
             str(output_path),
         ],
-        "jump-cuts",
+        step,
     )
     return max(0, len(segments) - 1)
+
+
+def cut_silences(input_path: Path, output_path: Path, job_dir: Path) -> int:
+    detect = run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-i",
+            str(input_path),
+            "-af",
+            "silencedetect=noise=-28dB:d=0.18",
+            "-f",
+            "null",
+            "-",
+        ],
+        "detect-silence",
+        capture=True,
+    )
+    silences = parse_silences((detect.stderr or "") + "\n" + (detect.stdout or ""))
+    duration = ffprobe_duration(input_path)
+    segments = speech_segments(duration, silences)
+    (job_dir / "segments.json").write_text(
+        json.dumps(
+            {
+                "duration": duration,
+                "silences": silences,
+                "segments": segments,
+                "cut_count": max(0, len(segments) - 1),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return render_segments(input_path, output_path, segments, "jump-cuts")
 
 
 def ass_time(seconds: float) -> str:
@@ -341,7 +344,31 @@ def build_caption_groups(words: list[dict[str, Any]]) -> list[tuple[float, float
     return groups
 
 
-def transcribe_and_write_captions(video_path: Path, job_dir: Path) -> Path | None:
+def write_ass_captions(words: list[dict[str, Any]], job_dir: Path, filename: str = "captions.ass") -> Path | None:
+    groups = build_caption_groups(words)
+    ass_path = job_dir / filename
+    lines = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "PlayResX: 1080",
+        "PlayResY: 1920",
+        "WrapStyle: 0",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        "Style: Hormozi,Arial,86,&H00FFFFFF,&H0000FFFF,&H00000000,&H88000000,-1,0,0,0,100,100,0,0,1,7,2,2,70,70,285,1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    for start, end, text in groups:
+        lines.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Hormozi,,0,0,0,,{ass_escape(text)}")
+    ass_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_status(captions=str(ass_path), caption_count=len(groups))
+    return ass_path if groups else None
+
+
+def transcribe_and_write_captions(video_path: Path, job_dir: Path) -> tuple[Path | None, list[dict[str, Any]]]:
     write_status(step="transcribe")
     try:
         import whisper  # type: ignore
@@ -366,31 +393,64 @@ def transcribe_and_write_captions(video_path: Path, job_dir: Path) -> Path | Non
                 for index, value in enumerate(text_words):
                     words.append({"word": value, "start": start + index * span, "end": start + (index + 1) * span})
 
-        groups = build_caption_groups(words)
-        ass_path = job_dir / "captions.ass"
-        lines = [
-            "[Script Info]",
-            "ScriptType: v4.00+",
-            "PlayResX: 1080",
-            "PlayResY: 1920",
-            "WrapStyle: 0",
-            "",
-            "[V4+ Styles]",
-            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-            "Style: Hormozi,Arial,86,&H00FFFFFF,&H0000FFFF,&H00000000,&H88000000,-1,0,0,0,100,100,0,0,1,7,2,2,70,70,285,1",
-            "",
-            "[Events]",
-            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
-        ]
-        for start, end, text in groups:
-            lines.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Hormozi,,0,0,0,,{ass_escape(text)}")
-        ass_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        write_status(transcript=str(transcript_path), captions=str(ass_path), caption_count=len(groups))
-        return ass_path if groups else None
+        (job_dir / "words.json").write_text(json.dumps(words, indent=2, ensure_ascii=True), encoding="utf-8")
+        ass_path = write_ass_captions(words, job_dir)
+        write_status(transcript=str(transcript_path))
+        return ass_path, words
     except Exception as exc:
         write_status(captions_error=str(exc)[:500])
         print(f"[transcribe] failed, rendering without captions: {exc}", flush=True)
-        return None
+        return None, []
+
+
+def word_gap_segments(words: list[dict[str, Any]], duration: float, max_gap: float = 0.22, padding: float = 0.035) -> list[tuple[float, float]]:
+    clean_words = [
+        word for word in words
+        if word.get("start") is not None and word.get("end") is not None and str(word.get("word", "")).strip()
+    ]
+    if len(clean_words) < 2:
+        return [(0.0, duration)]
+
+    segments: list[tuple[float, float]] = []
+    start = max(0.0, float(clean_words[0]["start"]) - padding)
+    last_end = float(clean_words[0]["end"])
+
+    for word in clean_words[1:]:
+        word_start = float(word["start"])
+        word_end = float(word["end"])
+        gap = word_start - last_end
+        if gap >= max_gap:
+            end = min(duration, last_end + padding)
+            if end - start >= 0.12:
+                segments.append((start, end))
+            start = max(0.0, word_start - padding)
+        last_end = max(last_end, word_end)
+
+    end = min(duration, last_end + padding)
+    if end - start >= 0.12:
+        segments.append((start, end))
+    return segments or [(0.0, duration)]
+
+
+def remap_words_to_segments(words: list[dict[str, Any]], segments: list[tuple[float, float]]) -> list[dict[str, Any]]:
+    remapped: list[dict[str, Any]] = []
+    offset = 0.0
+    for seg_start, seg_end in segments:
+        seg_duration = max(0.0, seg_end - seg_start)
+        for word in words:
+            if word.get("start") is None or word.get("end") is None:
+                continue
+            word_start = float(word["start"])
+            word_end = float(word["end"])
+            if word_end < seg_start or word_start > seg_end:
+                continue
+            copy = dict(word)
+            copy["start"] = offset + max(word_start, seg_start) - seg_start
+            copy["end"] = offset + min(word_end, seg_end) - seg_start
+            if copy["end"] > copy["start"]:
+                remapped.append(copy)
+        offset += seg_duration
+    return remapped
 
 
 def burn_captions_or_copy(input_path: Path, output_path: Path, captions_path: Path | None) -> None:
@@ -461,8 +521,36 @@ def main() -> int:
 
         normalize_video(raw_input, normalized)
         cut_count = cut_silences(normalized, edited, job_dir)
-        captions = transcribe_and_write_captions(edited, job_dir)
-        burn_captions_or_copy(edited, final, captions)
+        captions, words = transcribe_and_write_captions(edited, job_dir)
+        caption_input = edited
+
+        if cut_count == 0 and words:
+            duration_for_word_cuts = ffprobe_duration(edited)
+            gap_segments = word_gap_segments(words, duration_for_word_cuts)
+            (job_dir / "word_gap_segments.json").write_text(
+                json.dumps(
+                    {
+                        "duration": duration_for_word_cuts,
+                        "segments": gap_segments,
+                        "cut_count": max(0, len(gap_segments) - 1),
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            if len(gap_segments) > 1:
+                word_gap_cut = job_dir / "word_gap_cut.mp4"
+                cut_count = render_segments(edited, word_gap_cut, gap_segments, "word-gap-cuts")
+                remapped_words = remap_words_to_segments(words, gap_segments)
+                (job_dir / "words_remapped.json").write_text(
+                    json.dumps(remapped_words, indent=2, ensure_ascii=True),
+                    encoding="utf-8",
+                )
+                captions = write_ass_captions(remapped_words, job_dir)
+                caption_input = word_gap_cut
+                write_status(word_gap_cut=str(word_gap_cut), cut_count=cut_count)
+
+        burn_captions_or_copy(caption_input, final, captions)
         make_thumbnail(final, thumbnail)
 
         final_duration = ffprobe_duration(final)
