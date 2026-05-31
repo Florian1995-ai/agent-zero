@@ -522,6 +522,7 @@ def words_for_segments(words: list[dict[str, Any]], segments: list[tuple[float, 
             copy = dict(word)
             copy["start"] = offset + max(word_start, seg_start) - seg_start
             copy["end"] = offset + min(word_end, seg_end) - seg_start
+            copy["source_segment_index"] = index
             if copy["end"] > copy["start"]:
                 selected.append(copy)
         offset += seg_duration
@@ -544,13 +545,22 @@ def build_caption_groups(words: list[dict[str, Any]]) -> list[tuple[float, float
         text = " ".join(str(word.get("word", "")).strip() for word in current)
         text = re.sub(r"\s+", " ", text).strip()
         if text:
-            groups.append((start, max(end, start + 0.45), text.upper()))
+            end = max(end, start + 0.45)
+            if groups and start <= groups[-1][1]:
+                previous_start, previous_end, previous_text = groups[-1]
+                groups[-1] = (previous_start, max(previous_start + 0.2, start - 0.01), previous_text)
+            groups.append((start, end, text.upper()))
         current = []
 
     for word in words:
         value = str(word.get("word", "")).strip()
         if not value:
             continue
+        if current:
+            previous_segment = current[-1].get("source_segment_index")
+            next_segment = word.get("source_segment_index")
+            if previous_segment is not None and next_segment is not None and previous_segment != next_segment:
+                flush()
         if current:
             previous_end = float(current[-1].get("end", current[-1].get("start", 0)))
             next_start = float(word.get("start", previous_end))
@@ -1607,7 +1617,7 @@ def build_intro_teaser(content_video: Path, words: list[dict[str, Any]], analysi
                 running += max(0.0, end - start)
                 sfx_events.append({
                     "asset": "rapid_cut_whoosh",
-                    "time": max(0.0, running - cfg_float("rapid_intro", "whoosh_pre_roll", 0.08)),
+                    "time": max(0.0, running + cfg_float("rapid_intro", "whoosh_after_cut_delay_seconds", 0.0)),
                     "volume": cfg_float("audio", "rapid_cut_whoosh_volume", 0.18),
                     "duration": cfg_float("audio", "rapid_cut_whoosh_duration", 0.42),
                     "label": "rapid_cut",
