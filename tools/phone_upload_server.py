@@ -24,6 +24,8 @@ from urllib.parse import quote, unquote, urlparse
 
 UPLOAD_DIR = Path(os.getenv("AGENTZERO_UPLOAD_DIR", "/app/work_dir/assets/agentzero_uploads/shorts_test"))
 OUTPUT_ROOT = Path(os.getenv("AGENTZERO_OUTPUT_DIR", "/app/work_dir/assets/agentzero_outputs"))
+PIPELINE_DIR = Path(os.getenv("AGENTZERO_PIPELINE_DIR", "/app/work_dir/assets/agentzero_pipeline"))
+PIPELINE_CONFIG = Path(os.getenv("AGENTZERO_PIPELINE_CONFIG", str(PIPELINE_DIR / "pipeline_config.json")))
 RENDER_STATUS_FILE = OUTPUT_ROOT / "render_status.json"
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm"}
 render_process: subprocess.Popen | None = None
@@ -73,6 +75,19 @@ def read_render_status() -> dict:
         return {"state": "unknown", "error": str(exc)}
 
 
+def pipeline_info() -> dict:
+    return {
+        "mode": "mounted-live-pipeline",
+        "pipeline_dir": str(PIPELINE_DIR),
+        "pipeline_config": str(PIPELINE_CONFIG),
+        "upload_server_script": str(Path(__file__).resolve()),
+        "render_worker_script": str(Path(__file__).with_name("phone_render_worker.py").resolve()),
+        "audio_dir": str(PIPELINE_DIR / "audio"),
+        "logo_dir": str(PIPELINE_DIR / "logo"),
+        "note": "Edit files in pipeline_dir to tune the editing flow without rebuilding Docker.",
+    }
+
+
 def write_render_status(status: dict) -> None:
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     status["updated_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -107,6 +122,7 @@ def page(message: str = "") -> bytes:
     render_rss = html.escape(str(render_status.get("max_rss_mb", "")))
     render_final_url = html.escape(output_url_for(str(render_status.get("final", ""))))
     render_thumbnail_url = html.escape(output_url_for(str(render_status.get("thumbnail", ""))))
+    info = pipeline_info()
     body = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -247,6 +263,10 @@ def page(message: str = "") -> bytes:
       color: #ffd400;
       font-weight: 800;
     }}
+    .small {{
+      font-size: 13px;
+      color: #aaa;
+    }}
   </style>
 </head>
 <body>
@@ -254,6 +274,8 @@ def page(message: str = "") -> bytes:
     <h1>Agent Zero Upload</h1>
     <p>Upload one iPhone clip. The file will be saved into Agent Zero's mounted assets folder.</p>
     <p class="path">{html.escape(str(UPLOAD_DIR))}</p>
+    <p class="small">Live editing pipeline: <span class="path">{html.escape(info["pipeline_dir"])}</span></p>
+    <p class="small">Preset/config: <span class="path">{html.escape(info["pipeline_config"])}</span></p>
     {message_html}
     <form id="upload-form" method="post" enctype="multipart/form-data">
       <input id="video-input" type="file" name="video" accept="video/*" required>
@@ -484,6 +506,9 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/render-status":
             self.send_json(current_render_status())
+            return
+        if path == "/pipeline-info":
+            self.send_json(pipeline_info())
             return
         if path.startswith("/outputs/"):
             self.send_output(path)

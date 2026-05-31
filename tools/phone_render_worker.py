@@ -26,13 +26,68 @@ from typing import Any
 
 UPLOAD_DIR = Path(os.getenv("AGENTZERO_UPLOAD_DIR", "/app/work_dir/assets/agentzero_uploads/shorts_test"))
 OUTPUT_ROOT = Path(os.getenv("AGENTZERO_OUTPUT_DIR", "/app/work_dir/assets/agentzero_outputs"))
-AUDIO_ASSET_DIR = Path(os.getenv("AGENTZERO_AUDIO_ASSET_DIR", "/app/work_dir/assets/agentzero_assets/audio"))
-YOUTUBE_CREDENTIALS_PATH = Path(os.getenv("YOUTUBE_CREDENTIALS_PATH", "/app/work_dir/assets/youtube/credentials.json"))
-YOUTUBE_TOKEN_PATH = Path(os.getenv("YOUTUBE_TOKEN_PATH", "/app/work_dir/assets/youtube/token.json"))
+PIPELINE_DIR = Path(os.getenv("AGENTZERO_PIPELINE_DIR", "/app/work_dir/assets/agentzero_pipeline"))
+PIPELINE_CONFIG_PATH = Path(os.getenv("AGENTZERO_PIPELINE_CONFIG", str(PIPELINE_DIR / "pipeline_config.json")))
 STATE_FILE = OUTPUT_ROOT / "render_status.json"
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm"}
 PARTIAL_SUFFIXES = {".part", ".tmp", ".download", ".crdownload"}
 STAGE_TIMINGS: list[dict[str, Any]] = []
+
+
+def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def load_pipeline_config() -> dict[str, Any]:
+    if not PIPELINE_CONFIG_PATH.exists():
+        return {}
+    try:
+        data = json.loads(PIPELINE_CONFIG_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        print(f"[config] failed to read {PIPELINE_CONFIG_PATH}: {exc}", flush=True)
+        return {}
+
+
+PIPELINE_CONFIG = load_pipeline_config()
+
+
+def cfg(section: str, key: str, default: Any) -> Any:
+    value = PIPELINE_CONFIG.get(section, {})
+    if isinstance(value, dict):
+        return value.get(key, default)
+    return default
+
+
+def cfg_float(section: str, key: str, default: float) -> float:
+    try:
+        return float(cfg(section, key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def cfg_int(section: str, key: str, default: int) -> int:
+    try:
+        return int(cfg(section, key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def cfg_bool(section: str, key: str, default: bool) -> bool:
+    value = cfg(section, key, default)
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 EDITING_PRESET = {
     "name": "agentzero_hostinger_v2_locked_silence_2026_05_31",
     "description": "Locked preset from the first successful Hostinger phone render.",
@@ -67,6 +122,12 @@ EDITING_PRESET = {
         "alignment": "lower third center",
     },
 }
+if isinstance(PIPELINE_CONFIG.get("editing_preset"), dict):
+    EDITING_PRESET = deep_merge(EDITING_PRESET, PIPELINE_CONFIG["editing_preset"])
+
+AUDIO_ASSET_DIR = Path(os.getenv("AGENTZERO_AUDIO_ASSET_DIR", str(cfg("audio", "asset_dir", PIPELINE_DIR / "audio"))))
+YOUTUBE_CREDENTIALS_PATH = Path(os.getenv("YOUTUBE_CREDENTIALS_PATH", str(cfg("youtube", "credentials_path", "/app/work_dir/assets/youtube/credentials.json"))))
+YOUTUBE_TOKEN_PATH = Path(os.getenv("YOUTUBE_TOKEN_PATH", str(cfg("youtube", "token_path", "/app/work_dir/assets/youtube/token.json"))))
 
 
 def utc_now() -> str:
@@ -222,10 +283,18 @@ def make_job_dir(source: Path) -> Path:
 
 
 def normalize_video(input_path: Path, output_path: Path) -> None:
+    normalize = EDITING_PRESET.get("normalize", {})
+    width = int(normalize.get("width", 1080))
+    height = int(normalize.get("height", 1920))
+    fps = int(normalize.get("fps", 30))
+    preset = str(normalize.get("preset", "veryfast"))
+    crf = str(normalize.get("crf", 20))
+    audio_bitrate = str(normalize.get("audio_bitrate", "192k"))
+    loudnorm = str(normalize.get("audio_loudnorm", "I=-16:TP=-1.5:LRA=11"))
     vf = (
-        "scale=1080:1920:force_original_aspect_ratio=decrease,"
-        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,"
-        "setsar=1,fps=30,format=yuv420p"
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
+        f"setsar=1,fps={fps},format=yuv420p"
     )
     run(
         [
@@ -236,17 +305,17 @@ def normalize_video(input_path: Path, output_path: Path) -> None:
             "-vf",
             vf,
             "-af",
-            "loudnorm=I=-16:TP=-1.5:LRA=11",
+            f"loudnorm={loudnorm}",
             "-c:v",
             "libx264",
             "-preset",
-            "veryfast",
+            preset,
             "-crf",
-            "20",
+            crf,
             "-c:a",
             "aac",
             "-b:a",
-            "192k",
+            audio_bitrate,
             "-ar",
             "48000",
             "-ac",
@@ -265,7 +334,12 @@ def parse_silences(stderr: str) -> list[tuple[float, float]]:
     return [(start, end) for start, end in zip(starts, ends) if end > start]
 
 
-def speech_segments(duration: float, silences: list[tuple[float, float]], padding: float = 0.035) -> list[tuple[float, float]]:
+def speech_segments(
+    duration: float,
+    silences: list[tuple[float, float]],
+    padding: float = 0.035,
+    min_kept_segment: float = 0.12,
+) -> list[tuple[float, float]]:
     if not silences:
         return [(0.0, duration)]
 
@@ -274,11 +348,11 @@ def speech_segments(duration: float, silences: list[tuple[float, float]], paddin
     for silence_start, silence_end in silences:
         start = cursor
         end = max(cursor, silence_start + padding)
-        if end - start >= 0.12:
+        if end - start >= min_kept_segment:
             keep.append((start, min(duration, end)))
         cursor = max(cursor, silence_end - padding)
 
-    if duration - cursor >= 0.12:
+    if duration - cursor >= min_kept_segment:
         keep.append((cursor, duration))
 
     if not keep:
@@ -331,6 +405,11 @@ def render_segments(input_path: Path, output_path: Path, segments: list[tuple[fl
 
 
 def cut_silences(input_path: Path, output_path: Path, job_dir: Path) -> int:
+    silence = EDITING_PRESET.get("silence_cut", {})
+    noise = str(silence.get("noise", "-28dB"))
+    silence_duration = float(silence.get("duration", 0.18))
+    padding = float(silence.get("padding_seconds", 0.035))
+    min_kept = float(silence.get("min_kept_segment_seconds", 0.12))
     detect = run(
         [
             "ffmpeg",
@@ -338,7 +417,7 @@ def cut_silences(input_path: Path, output_path: Path, job_dir: Path) -> int:
             "-i",
             str(input_path),
             "-af",
-            "silencedetect=noise=-28dB:d=0.18",
+            f"silencedetect=noise={noise}:d={silence_duration}",
             "-f",
             "null",
             "-",
@@ -348,7 +427,7 @@ def cut_silences(input_path: Path, output_path: Path, job_dir: Path) -> int:
     )
     silences = parse_silences((detect.stderr or "") + "\n" + (detect.stdout or ""))
     duration = ffprobe_duration(input_path)
-    segments = speech_segments(duration, silences)
+    segments = speech_segments(duration, silences, padding=padding, min_kept_segment=min_kept)
     (job_dir / "segments.json").write_text(
         json.dumps(
             {
@@ -644,8 +723,14 @@ def fallback_analysis(words: list[dict[str, Any]], duration: float, reason: str)
 
 def estimate_openrouter_cost(prompt_chars: int, output_tokens: int = 900) -> dict[str, Any]:
     prompt_tokens = max(1, int(prompt_chars / 4))
-    prompt_price_per_million = env_float("OPENROUTER_PROMPT_PRICE_PER_MILLION", 1.25)
-    completion_price_per_million = env_float("OPENROUTER_COMPLETION_PRICE_PER_MILLION", 10.0)
+    prompt_price_per_million = env_float(
+        "OPENROUTER_PROMPT_PRICE_PER_MILLION",
+        cfg_float("llm", "prompt_price_per_million", 1.25),
+    )
+    completion_price_per_million = env_float(
+        "OPENROUTER_COMPLETION_PRICE_PER_MILLION",
+        cfg_float("llm", "completion_price_per_million", 10.0),
+    )
     estimated = (prompt_tokens / 1_000_000 * prompt_price_per_million) + (
         output_tokens / 1_000_000 * completion_price_per_million
     )
@@ -694,24 +779,27 @@ def normalize_nuggets(raw_nuggets: Any, words: list[dict[str, Any]], duration: f
 
     picked: list[dict[str, Any]] = []
     total = 0.0
+    max_seconds = cfg_float("intro_teaser", "max_seconds", 8.5)
+    target_seconds = cfg_float("intro_teaser", "target_seconds", 8.0)
+    max_nuggets = cfg_int("intro_teaser", "max_nuggets", 3)
     for item in normalized[:5]:
         length = item["end"] - item["start"]
-        if total >= 7.5:
+        if total >= max(0.8, target_seconds - 0.5):
             break
-        if total + length > 8.5:
+        if total + length > max_seconds:
             item = dict(item)
-            item["end"] = round(item["start"] + max(1.0, 8.0 - total), 3)
+            item["end"] = round(item["start"] + max(1.0, target_seconds - total), 3)
             length = item["end"] - item["start"]
         picked.append(item)
         total += length
 
     if not picked:
-        return candidate_nuggets(words, duration, limit=3)
-    return picked[:3]
+        return candidate_nuggets(words, duration, limit=max_nuggets)
+    return picked[:max_nuggets]
 
 
 def analyze_transcript(words: list[dict[str, Any]], duration: float, job_dir: Path) -> dict[str, Any]:
-    provider = os.getenv("LLM_PROVIDER", "openrouter").strip().lower()
+    provider = os.getenv("LLM_PROVIDER", str(cfg("llm", "provider", "openrouter"))).strip().lower()
     transcript_text = plain_text_from_words(words)
     usage_path = job_dir / "llm_usage.json"
 
@@ -752,7 +840,7 @@ def analyze_transcript(words: list[dict[str, Any]], duration: float, job_dir: Pa
         f"Word timestamps JSON:\n{json.dumps(compact_words, ensure_ascii=True)}"
     )
     estimate = estimate_openrouter_cost(len(prompt))
-    max_cost = env_float("LLM_MAX_COST_PER_JOB_USD", 0.20)
+    max_cost = env_float("LLM_MAX_COST_PER_JOB_USD", cfg_float("llm", "max_cost_per_job_usd", 0.20))
     if estimate["estimated_cost_usd"] > max_cost:
         analysis = fallback_analysis(words, duration, "Estimated LLM cost above cap")
         save_json(usage_path, {
@@ -764,7 +852,7 @@ def analyze_transcript(words: list[dict[str, Any]], duration: float, job_dir: Pa
         })
         return analysis
 
-    model = os.getenv("OPENROUTER_MODEL", "openai/gpt-5").strip() or "openai/gpt-5"
+    model = os.getenv("OPENROUTER_MODEL", str(cfg("llm", "model", "openai/gpt-5"))).strip() or "openai/gpt-5"
     payload = {
         "model": model,
         "messages": [
@@ -830,11 +918,17 @@ def analyze_transcript(words: list[dict[str, Any]], duration: float, job_dir: Pa
 
 
 def build_intro_teaser(content_video: Path, words: list[dict[str, Any]], analysis: dict[str, Any], job_dir: Path) -> tuple[Path, list[dict[str, Any]], float, list[dict[str, Any]]]:
+    if not cfg_bool("intro_teaser", "enabled", True):
+        save_json(job_dir / "intro_nuggets.json", {"enabled": False, "nuggets": [], "segments": [], "duration": 0.0})
+        write_status(intro_teaser="", intro_duration=0.0, intro_nuggets=0)
+        return content_video, [], 0.0, []
+
     duration = ffprobe_duration(content_video)
+    max_nuggets = cfg_int("intro_teaser", "max_nuggets", 3)
     nuggets = normalize_nuggets(analysis.get("nuggets"), words, duration)
     if not nuggets:
-        nuggets = candidate_nuggets(words, duration, limit=3)
-    segments = [(float(item["start"]), float(item["end"])) for item in nuggets[:3]]
+        nuggets = candidate_nuggets(words, duration, limit=max_nuggets)
+    segments = [(float(item["start"]), float(item["end"])) for item in nuggets[:max_nuggets]]
     if not segments:
         return content_video, [], 0.0, []
 
@@ -843,13 +937,13 @@ def build_intro_teaser(content_video: Path, words: list[dict[str, Any]], analysi
     teaser_duration = ffprobe_duration(teaser)
     teaser_words = words_for_segments(words, segments)
     save_json(job_dir / "intro_nuggets.json", {
-        "nuggets": nuggets[:3],
+        "nuggets": nuggets[:max_nuggets],
         "segments": segments,
         "duration": teaser_duration,
         "source": analysis.get("source", "unknown"),
     })
     write_status(intro_teaser=str(teaser), intro_duration=round(teaser_duration, 2), intro_nuggets=len(segments))
-    return teaser, teaser_words, teaser_duration, nuggets[:3]
+    return teaser, teaser_words, teaser_duration, nuggets[:max_nuggets]
 
 
 def concat_intro_and_main(teaser: Path, main_video: Path, output_path: Path, job_dir: Path) -> None:
@@ -963,9 +1057,9 @@ def generate_test_audio_assets(asset_dir: Path) -> dict[str, Any]:
 def resolve_audio_assets(job_dir: Path) -> dict[str, Any]:
     AUDIO_ASSET_DIR.mkdir(parents=True, exist_ok=True)
     configured = {
-        "intro_chime": Path(os.getenv("INTRO_CHIME_PATH", str(AUDIO_ASSET_DIR / "intro_chime.wav"))),
-        "transition_whoosh": Path(os.getenv("TRANSITION_WHOOSH_PATH", str(AUDIO_ASSET_DIR / "transition_whoosh.wav"))),
-        "music_bed": Path(os.getenv("MUSIC_BED_PATH", str(AUDIO_ASSET_DIR / "music_bed.wav"))),
+        "intro_chime": Path(os.getenv("INTRO_CHIME_PATH", str(cfg("audio", "intro_chime", AUDIO_ASSET_DIR / "intro_chime.wav")))),
+        "transition_whoosh": Path(os.getenv("TRANSITION_WHOOSH_PATH", str(cfg("audio", "transition_whoosh", AUDIO_ASSET_DIR / "transition_whoosh.wav")))),
+        "music_bed": Path(os.getenv("MUSIC_BED_PATH", str(cfg("audio", "music_bed", AUDIO_ASSET_DIR / "music_bed.wav")))),
     }
     if all(path.exists() for path in configured.values()):
         manifest = {
@@ -992,12 +1086,17 @@ def mix_audio_bed(input_path: Path, output_path: Path, assets: dict[str, Any], t
 
     duration = ffprobe_duration(input_path)
     whoosh_ms = max(0, int(max(0.0, teaser_duration - 0.18) * 1000))
+    chime_volume = cfg_float("audio", "chime_volume", 0.26)
+    whoosh_volume = cfg_float("audio", "whoosh_volume", 0.20)
+    music_volume = cfg_float("audio", "music_volume", 0.055)
+    ducking_threshold = cfg_float("audio", "ducking_threshold", 0.03)
+    ducking_ratio = cfg_float("audio", "ducking_ratio", 8.0)
     filter_complex = (
         "[0:a]aformat=sample_rates=48000:channel_layouts=stereo,volume=1.0[voice];"
-        f"[3:a]atrim=0:{duration:.3f},aformat=sample_rates=48000:channel_layouts=stereo,volume=0.055[music];"
-        "[music][voice]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=350[ducked];"
-        "[1:a]aformat=sample_rates=48000:channel_layouts=stereo,adelay=0|0,volume=0.26[chime];"
-        f"[2:a]aformat=sample_rates=48000:channel_layouts=stereo,adelay={whoosh_ms}|{whoosh_ms},volume=0.20[whoosh];"
+        f"[3:a]atrim=0:{duration:.3f},aformat=sample_rates=48000:channel_layouts=stereo,volume={music_volume}[music];"
+        f"[music][voice]sidechaincompress=threshold={ducking_threshold}:ratio={ducking_ratio}:attack=20:release=350[ducked];"
+        f"[1:a]aformat=sample_rates=48000:channel_layouts=stereo,adelay=0|0,volume={chime_volume}[chime];"
+        f"[2:a]aformat=sample_rates=48000:channel_layouts=stereo,adelay={whoosh_ms}|{whoosh_ms},volume={whoosh_volume}[whoosh];"
         "[voice][ducked][chime][whoosh]amix=inputs=4:duration=first:dropout_transition=0,alimiter=limit=0.95[aout]"
     )
     run(
@@ -1115,7 +1214,7 @@ def make_thumbnail(video_path: Path, output_path: Path) -> None:
 
 def upload_to_youtube(video_path: Path, thumbnail_path: Path, metadata: dict[str, Any], job_dir: Path) -> dict[str, Any]:
     status_path = job_dir / "upload_status.json"
-    enabled = env_bool("YOUTUBE_UPLOAD_ENABLED", True)
+    enabled = env_bool("YOUTUBE_UPLOAD_ENABLED", cfg_bool("youtube", "upload_enabled", True))
     if not enabled:
         status = {"state": "skipped", "reason": "YOUTUBE_UPLOAD_ENABLED=false"}
         save_json(status_path, status)
@@ -1170,10 +1269,10 @@ def upload_to_youtube(video_path: Path, thumbnail_path: Path, metadata: dict[str
                 "title": title[:100],
                 "description": description[:5000],
                 "tags": metadata.get("tags", [])[:15],
-                "categoryId": str(os.getenv("YOUTUBE_CATEGORY_ID", "27")),
+                "categoryId": str(os.getenv("YOUTUBE_CATEGORY_ID", str(cfg("youtube", "category_id", "27")))),
             },
             "status": {
-                "privacyStatus": os.getenv("YOUTUBE_PRIVACY_STATUS", "public"),
+                "privacyStatus": os.getenv("YOUTUBE_PRIVACY_STATUS", str(cfg("youtube", "privacy_status", "public"))),
                 "selfDeclaredMadeForKids": False,
             },
         }
@@ -1211,7 +1310,14 @@ def upload_to_youtube(video_path: Path, thumbnail_path: Path, metadata: dict[str
 
 def main() -> int:
     render_started = time.perf_counter()
-    write_status(state="running", started_at=utc_now(), upload_dir=str(UPLOAD_DIR), output_root=str(OUTPUT_ROOT))
+    write_status(
+        state="running",
+        started_at=utc_now(),
+        upload_dir=str(UPLOAD_DIR),
+        output_root=str(OUTPUT_ROOT),
+        pipeline_dir=str(PIPELINE_DIR),
+        pipeline_config=str(PIPELINE_CONFIG_PATH),
+    )
     try:
         source, probe = newest_valid_upload()
         job_dir = make_job_dir(source)
@@ -1229,6 +1335,7 @@ def main() -> int:
         shutil.copy2(source, raw_input)
         save_json(job_dir / "input_probe.json", probe)
         save_json(job_dir / "editing_preset.json", EDITING_PRESET)
+        save_json(job_dir / "pipeline_config_snapshot.json", PIPELINE_CONFIG)
 
         normalize_video(raw_input, normalized)
         cut_count = cut_silences(normalized, edited, job_dir)
@@ -1236,9 +1343,15 @@ def main() -> int:
         content_video = edited
         content_words = words
 
-        if cut_count == 0 and words:
+        word_gap_config = EDITING_PRESET.get("word_gap_fallback", {})
+        if cut_count == 0 and words and bool(word_gap_config.get("enabled", True)):
             duration_for_word_cuts = ffprobe_duration(edited)
-            gap_segments = word_gap_segments(words, duration_for_word_cuts)
+            gap_segments = word_gap_segments(
+                words,
+                duration_for_word_cuts,
+                max_gap=float(word_gap_config.get("max_gap_seconds", 0.22)),
+                padding=float(word_gap_config.get("padding_seconds", 0.035)),
+            )
             save_json(job_dir / "word_gap_segments.json", {
                 "duration": duration_for_word_cuts,
                 "segments": gap_segments,
@@ -1289,9 +1402,11 @@ def main() -> int:
         resources = resource_snapshot(render_started)
         save_json(job_dir / "resource_usage.json", resources)
         metadata = {
-            "privacy_status": os.getenv("YOUTUBE_PRIVACY_STATUS", "public"),
+            "privacy_status": os.getenv("YOUTUBE_PRIVACY_STATUS", str(cfg("youtube", "privacy_status", "public"))),
             "style": "tight jump cuts, intro teaser, ducked music bed, bold burned-in short-form captions",
             "editing_preset": EDITING_PRESET["name"],
+            "pipeline_dir": str(PIPELINE_DIR),
+            "pipeline_config": str(PIPELINE_CONFIG_PATH),
             "source": str(source),
             "job_dir": str(job_dir),
             "final": str(final),
