@@ -49,10 +49,13 @@
       "market growing"
     ],
     "min_matches": 2,
-    "padding_seconds": 0.045,
-    "min_clip_seconds": 0.42,
-    "max_clip_seconds": 1.15,
-    "whoosh_pre_roll": 0.08
+    "padding_seconds": 0.08,
+    "pre_padding_seconds": 0.06,
+    "post_padding_seconds": 0.08,
+    "min_clip_seconds": 1.1,
+    "max_clip_seconds": 2.75,
+    "pause_after_clip_seconds": 0.2,
+    "whoosh_pre_roll": 0.06
   },
   "llm": {
     "provider": "openrouter",

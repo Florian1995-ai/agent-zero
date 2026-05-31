@@ -371,18 +371,37 @@ def speech_segments(
     return keep
 
 
-def render_segments(input_path: Path, output_path: Path, segments: list[tuple[float, float]], step: str) -> int:
-    if len(segments) <= 1:
-        shutil.copy2(input_path, output_path)
-        return 0
+def render_segments(
+    input_path: Path,
+    output_path: Path,
+    segments: list[tuple[float, float]],
+    step: str,
+    gap_after_seconds: float = 0.0,
+) -> int:
+    if not segments:
+        raise ValueError(f"{step} requires at least one segment")
 
     filters: list[str] = []
     concat_inputs: list[str] = []
     for index, (start, end) in enumerate(segments):
-        filters.append(f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS[v{index}]")
-        filters.append(f"[0:a]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS[a{index}]")
+        pause = max(0.0, gap_after_seconds) if index < len(segments) - 1 else 0.0
+        duration = max(0.0, end - start) + pause
+        video_filter = f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS"
+        audio_filter = f"[0:a]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS"
+        if pause > 0:
+            video_filter += f",tpad=stop_mode=clone:stop_duration={pause:.3f}"
+            audio_filter += f",apad=pad_dur={pause:.3f},atrim=0:{duration:.3f}"
+        filters.append(f"{video_filter}[v{index}]")
+        filters.append(f"{audio_filter}[a{index}]")
         concat_inputs.append(f"[v{index}][a{index}]")
-    filter_complex = ";".join(filters) + ";" + "".join(concat_inputs) + f"concat=n={len(segments)}:v=1:a=1[outv][outa]"
+    if len(segments) == 1:
+        filter_complex = ";".join(filters)
+        outv = "[v0]"
+        outa = "[a0]"
+    else:
+        filter_complex = ";".join(filters) + ";" + "".join(concat_inputs) + f"concat=n={len(segments)}:v=1:a=1[outv][outa]"
+        outv = "[outv]"
+        outa = "[outa]"
 
     run(
         [
@@ -393,9 +412,9 @@ def render_segments(input_path: Path, output_path: Path, segments: list[tuple[fl
             "-filter_complex",
             filter_complex,
             "-map",
-            "[outv]",
+            outv,
             "-map",
-            "[outa]",
+            outa,
             "-c:v",
             "libx264",
             "-preset",
@@ -467,6 +486,11 @@ def ass_escape(text: str) -> str:
     return text.replace("{", "").replace("}", "").replace("\n", " ").strip()
 
 
+def ffmpeg_filter_path(path: Path) -> str:
+    value = str(path.resolve()).replace("\\", "/")
+    return value.replace(":", "\\:")
+
+
 def plain_text_from_words(words: list[dict[str, Any]]) -> str:
     return re.sub(r"\s+", " ", " ".join(str(word.get("word", "")).strip() for word in words)).strip()
 
@@ -483,10 +507,10 @@ def shift_words(words: list[dict[str, Any]], offset: float) -> list[dict[str, An
     return shifted
 
 
-def words_for_segments(words: list[dict[str, Any]], segments: list[tuple[float, float]]) -> list[dict[str, Any]]:
+def words_for_segments(words: list[dict[str, Any]], segments: list[tuple[float, float]], gap_after_seconds: float = 0.0) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     offset = 0.0
-    for seg_start, seg_end in segments:
+    for index, (seg_start, seg_end) in enumerate(segments):
         seg_duration = max(0.0, seg_end - seg_start)
         for word in words:
             if word.get("start") is None or word.get("end") is None:
@@ -501,12 +525,15 @@ def words_for_segments(words: list[dict[str, Any]], segments: list[tuple[float, 
             if copy["end"] > copy["start"]:
                 selected.append(copy)
         offset += seg_duration
+        if index < len(segments) - 1:
+            offset += max(0.0, gap_after_seconds)
     return selected
 
 
 def build_caption_groups(words: list[dict[str, Any]]) -> list[tuple[float, float, str]]:
     groups: list[tuple[float, float, str]] = []
     current: list[dict[str, Any]] = []
+    max_gap = cfg_float("captions", "max_word_gap_seconds", 0.16)
 
     def flush() -> None:
         nonlocal current
@@ -524,6 +551,11 @@ def build_caption_groups(words: list[dict[str, Any]]) -> list[tuple[float, float
         value = str(word.get("word", "")).strip()
         if not value:
             continue
+        if current:
+            previous_end = float(current[-1].get("end", current[-1].get("start", 0)))
+            next_start = float(word.get("start", previous_end))
+            if next_start - previous_end > max_gap:
+                flush()
         current.append(word)
         text = " ".join(str(item.get("word", "")).strip() for item in current)
         duration = float(current[-1].get("end", 0)) - float(current[0].get("start", 0))
@@ -1347,11 +1379,26 @@ def normalized_word_token(value: str) -> str:
 def phrase_variants(phrase: str) -> list[str]:
     clean = phrase.strip().lower()
     if clean in {"4 factors", "four factors"}:
-        variants = ["four factors", "4 factors"]
+        variants = [
+            "there are four factors to consider",
+            "there are four factors",
+            "four factors to consider",
+            "four factors",
+            "4 factors",
+        ]
     elif clean == "pain":
-        variants = ["market in pain", "pain"]
+        variants = [
+            "is the market in pain",
+            "market in pain",
+            "pain",
+        ]
     elif clean in {"market growing", "is the market growing"}:
-        variants = ["is the market growing", "market growing"]
+        variants = [
+            "is the market growing or is it declining",
+            "the market growing or is it declining",
+            "is the market growing",
+            "market growing",
+        ]
     else:
         variants = [clean]
     deduped: list[str] = []
@@ -1370,8 +1417,10 @@ def find_phrase_segment(words: list[dict[str, Any]], phrase: str, duration: floa
     ]
     tokens = [normalized_word_token(str(word.get("word", ""))) for word in clean_words]
     padding = cfg_float("rapid_intro", "padding_seconds", 0.045)
-    min_clip = cfg_float("rapid_intro", "min_clip_seconds", 0.42)
-    max_clip = cfg_float("rapid_intro", "max_clip_seconds", 1.15)
+    pre_padding = cfg_float("rapid_intro", "pre_padding_seconds", padding)
+    post_padding = cfg_float("rapid_intro", "post_padding_seconds", padding)
+    min_clip = cfg_float("rapid_intro", "min_clip_seconds", 1.10)
+    max_clip = cfg_float("rapid_intro", "max_clip_seconds", 2.75)
 
     for variant in phrase_variants(phrase):
         phrase_tokens = [normalized_word_token(part) for part in variant.split() if normalized_word_token(part)]
@@ -1381,20 +1430,28 @@ def find_phrase_segment(words: list[dict[str, Any]], phrase: str, duration: floa
             if tokens[index:index + len(phrase_tokens)] != phrase_tokens:
                 continue
             phrase_end_index = index + len(phrase_tokens) - 1
-            start = max(0.0, float(clean_words[index]["start"]) - padding)
-            end = min(duration, float(clean_words[phrase_end_index]["end"]) + padding)
+            phrase_start = float(clean_words[index]["start"])
+            phrase_end = float(clean_words[phrase_end_index]["end"])
+            start = max(0.0, phrase_start - pre_padding)
+            end = min(duration, phrase_end + post_padding)
             if index > 0:
-                start = max(start, float(clean_words[index - 1]["end"]))
+                start = max(start, float(clean_words[index - 1]["end"]) + 0.001)
             if phrase_end_index + 1 < len(clean_words):
-                end = min(end, float(clean_words[phrase_end_index + 1]["start"]))
-            while end - start < min_clip and index + len(phrase_tokens) < len(clean_words):
-                next_index = index + len(phrase_tokens)
-                end = min(duration, float(clean_words[next_index]["end"]) + padding)
-                if next_index + 1 < len(clean_words):
-                    end = min(end, float(clean_words[next_index + 1]["start"]))
-                phrase_tokens.append(tokens[index + len(phrase_tokens)])
+                end = min(end, float(clean_words[phrase_end_index + 1]["start"]) - 0.001)
+            if end - start < min_clip:
+                missing = min_clip - (end - start)
+                start = max(0.0, start - missing * 0.35)
+                end = min(duration, end + missing * 0.65)
+                if index > 0:
+                    start = max(start, float(clean_words[index - 1]["end"]) + 0.001)
+                if phrase_end_index + 1 < len(clean_words):
+                    end = min(end, float(clean_words[phrase_end_index + 1]["start"]) - 0.001)
             if end - start > max_clip:
+                midpoint = (phrase_start + phrase_end) / 2
+                start = max(0.0, midpoint - max_clip / 2)
                 end = min(duration, start + max_clip)
+                if end - start < max_clip:
+                    start = max(0.0, end - max_clip)
             segment_words = words_in_time_range(words, start, end)
             return {
                 "start": round(start, 3),
@@ -1538,10 +1595,11 @@ def build_intro_teaser(content_video: Path, words: list[dict[str, Any]], analysi
         phrase_nuggets = build_rapid_intro_segments(words, duration)
         if phrase_nuggets:
             phrase_segments = [(float(item["start"]), float(item["end"])) for item in phrase_nuggets]
+            pause_after_clip = cfg_float("rapid_intro", "pause_after_clip_seconds", 0.0)
             rapid_intro = job_dir / "rapid_phrase_intro.mp4"
-            render_segments(content_video, rapid_intro, phrase_segments, "rapid-phrase-intro")
+            render_segments(content_video, rapid_intro, phrase_segments, "rapid-phrase-intro", gap_after_seconds=pause_after_clip)
             rapid_duration = ffprobe_duration(rapid_intro)
-            rapid_words = words_for_segments(words, phrase_segments)
+            rapid_words = words_for_segments(words, phrase_segments, gap_after_seconds=pause_after_clip)
 
             sfx_events: list[dict[str, Any]] = []
             running = 0.0
@@ -1554,6 +1612,7 @@ def build_intro_teaser(content_video: Path, words: list[dict[str, Any]], analysi
                     "duration": cfg_float("audio", "rapid_cut_whoosh_duration", 0.42),
                     "label": "rapid_cut",
                 })
+                running += max(0.0, pause_after_clip)
 
             intro_parts = [rapid_intro]
             logo_reveal, logo_duration = create_logo_reveal(job_dir)
@@ -1587,6 +1646,7 @@ def build_intro_teaser(content_video: Path, words: list[dict[str, Any]], analysi
                 "duration": teaser_duration,
                 "rapid_duration": rapid_duration,
                 "logo_duration": logo_duration,
+                "pause_after_clip_seconds": pause_after_clip,
                 "sfx_events": sfx_events,
                 "source": "configured_phrase_intro",
             })
@@ -1693,7 +1753,11 @@ def generate_test_audio_assets(asset_dir: Path) -> dict[str, Any]:
 
 
 def resolve_audio_assets(job_dir: Path) -> dict[str, Any]:
-    AUDIO_ASSET_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        AUDIO_ASSET_DIR.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        # Local fast-preview folders can be read-only; generated fallbacks live in the job folder.
+        pass
     configured = {
         "intro_chime": Path(os.getenv("INTRO_CHIME_PATH", str(rebase_pipeline_path(cfg("audio", "intro_chime", AUDIO_ASSET_DIR / "intro_chime.wav"), AUDIO_ASSET_DIR / "intro_chime.wav")))),
         "transition_whoosh": Path(os.getenv("TRANSITION_WHOOSH_PATH", str(rebase_pipeline_path(cfg("audio", "transition_whoosh", AUDIO_ASSET_DIR / "transition_whoosh.wav"), AUDIO_ASSET_DIR / "transition_whoosh.wav")))),
@@ -1704,10 +1768,19 @@ def resolve_audio_assets(job_dir: Path) -> dict[str, Any]:
     }
     required = {"intro_chime", "transition_whoosh", "music_bed"}
     if not all(configured[key].exists() for key in required):
-        manifest = generate_test_audio_assets(AUDIO_ASSET_DIR)
+        generated = generate_test_audio_assets(job_dir / "generated_audio_assets")
+        manifest = {
+            "mode": "configured_assets_with_generated_fallbacks",
+            "asset_dir": str(AUDIO_ASSET_DIR),
+            "generated_asset_dir": generated.get("asset_dir", ""),
+            "note": "Using configured audio assets where present and generated placeholders for missing required assets.",
+            "candidate_sources": generated.get("candidate_sources", {}),
+        }
         for key, path in configured.items():
             if path.exists():
                 manifest[key] = str(path)
+            elif generated.get(key):
+                manifest[key] = str(generated[key])
         for optional, fallback in {
             "rapid_cut_whoosh": "transition_whoosh",
             "logo_whoosh": "transition_whoosh",
@@ -1855,7 +1928,7 @@ def burn_captions_or_copy(input_path: Path, output_path: Path, captions_path: Pa
                 "-i",
                 str(input_path),
                 "-vf",
-                f"subtitles={captions_path}",
+                f"subtitles='{ffmpeg_filter_path(captions_path)}'",
                 "-c:v",
                 "libx264",
                 "-preset",
