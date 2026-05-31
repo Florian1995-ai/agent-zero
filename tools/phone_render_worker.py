@@ -704,14 +704,18 @@ def candidate_nuggets(words: list[dict[str, Any]], duration: float, limit: int =
 
 WEAK_NUGGET_STARTS = {
     "and", "are", "as", "because", "but", "for", "if", "in", "is", "it",
-    "of", "or", "piece", "so", "that", "the", "then", "to", "was", "we",
+    "of", "or", "other", "piece", "so", "that", "then", "to", "was", "we",
 }
 
 SUSPECT_TRANSCRIPT_PHRASES = {
     " dust ",
     " market air ",
     " the ready",
+    " one the first one ",
+    " one of the first one ",
 }
+
+TRAILING_INCOMPLETE_WORDS = {"a", "and", "can", "of", "or", "the", "to"}
 
 VALUE_NUGGET_TERMS = {
     "ai", "agency", "business", "client", "factor", "factors", "find",
@@ -773,6 +777,14 @@ def add_coherent_candidate(
     word_count = text_word_count(text)
     if word_count < 5 or end - start < 1.4:
         return
+    lower = f" {text.lower()} "
+    last_word = re.findall(r"[A-Za-z0-9][A-Za-z0-9'-]*", text.lower())
+    if nugget_first_word(text) in WEAK_NUGGET_STARTS:
+        return
+    if last_word and last_word[-1] in TRAILING_INCOMPLETE_WORDS:
+        return
+    if any(phrase in lower for phrase in SUSPECT_TRANSCRIPT_PHRASES):
+        return
     probabilities = [
         float(word.get("probability", 1.0))
         for word in chunk
@@ -820,7 +832,8 @@ def coherent_nugget_candidates(words: list[dict[str, Any]], duration: float, lim
             group = []
     add_coherent_candidate(candidates, group, duration)
 
-    candidates.extend(candidate_nuggets(words, duration, limit=limit))
+    if not candidates:
+        candidates.extend(candidate_nuggets(words, duration, limit=limit))
     deduped: list[dict[str, Any]] = []
     for item in sorted(candidates, key=lambda got: got["score"], reverse=True):
         overlaps = any(
@@ -846,6 +859,9 @@ def nugget_quality_issue(item: dict[str, Any], words: list[dict[str, Any]]) -> s
         return f"weak start word: {first_word}"
     if text.rstrip().endswith((",", ";", ":", "and", "or", "to")):
         return "trailing incomplete phrase"
+    words_in_text = re.findall(r"[A-Za-z0-9][A-Za-z0-9'-]*", text.lower())
+    if words_in_text and words_in_text[-1] in TRAILING_INCOMPLETE_WORDS:
+        return "trailing incomplete word"
     if any(phrase in lower for phrase in SUSPECT_TRANSCRIPT_PHRASES):
         return "suspect transcript phrase"
     return ""
