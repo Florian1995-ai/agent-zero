@@ -743,7 +743,9 @@ def estimate_openrouter_cost(prompt_chars: int, output_tokens: int = 900) -> dic
     }
 
 
-def parse_llm_json(content: str) -> dict[str, Any]:
+def parse_llm_json(content: Any) -> dict[str, Any]:
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("LLM response content was empty")
     content = content.strip()
     if content.startswith("```"):
         content = re.sub(r"^```(?:json)?", "", content).strip()
