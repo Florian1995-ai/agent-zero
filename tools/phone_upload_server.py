@@ -41,6 +41,13 @@ def safe_filename(filename: str) -> str:
     return f"{timestamp}-{clean_stem[:64]}{suffix}"
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def list_uploads() -> str:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     rows = []
@@ -92,6 +99,12 @@ def page(message: str = "") -> bytes:
     render_step = html.escape(str(render_status.get("step", "")))
     render_final = html.escape(str(render_status.get("final", "")))
     render_thumbnail = html.escape(str(render_status.get("thumbnail", "")))
+    render_llm = html.escape(str(render_status.get("llm_status", "")))
+    render_llm_cost = html.escape(str(render_status.get("llm_actual_cost_usd") or render_status.get("llm_estimated_cost_usd") or ""))
+    render_youtube = html.escape(str(render_status.get("youtube_status", "")))
+    render_youtube_url = html.escape(str(render_status.get("youtube_url", "")))
+    render_elapsed = html.escape(str(render_status.get("elapsed_seconds", "")))
+    render_rss = html.escape(str(render_status.get("max_rss_mb", "")))
     render_final_url = html.escape(output_url_for(str(render_status.get("final", ""))))
     render_thumbnail_url = html.escape(output_url_for(str(render_status.get("thumbnail", ""))))
     body = f"""<!doctype html>
@@ -263,10 +276,15 @@ def page(message: str = "") -> bytes:
       <div id="render-output" class="render-output">State: {render_state}
 Step: {render_step}
 Final: {render_final}
-Thumbnail: {render_thumbnail}</div>
+Thumbnail: {render_thumbnail}
+LLM: {render_llm} {render_llm_cost}
+YouTube: {render_youtube} {render_youtube_url}
+Elapsed seconds: {render_elapsed}
+Max RSS MB: {render_rss}</div>
       <p id="render-links">
         {f'<a href="{render_final_url}" target="_blank">Open final.mp4</a>' if render_final_url else ''}
         {f' &middot; <a href="{render_thumbnail_url}" target="_blank">Open thumbnail.jpg</a>' if render_thumbnail_url else ''}
+        {f' &middot; <a href="{render_youtube_url}" target="_blank">Open YouTube</a>' if render_youtube_url else ''}
       </p>
     </section>
     <h2>Recent Uploads</h2>
@@ -371,7 +389,12 @@ Thumbnail: {render_thumbnail}</div>
         "Final: " + (data.final || ""),
         "Thumbnail: " + (data.thumbnail || ""),
         "Duration: " + (data.duration || ""),
+        "Intro: " + (data.intro_duration || ""),
         "Cuts: " + (data.cut_count || ""),
+        "LLM: " + (data.llm_status || "") + " cost: " + (data.llm_actual_cost_usd || data.llm_estimated_cost_usd || ""),
+        "YouTube: " + (data.youtube_status || "") + " " + (data.youtube_url || ""),
+        "Elapsed seconds: " + (data.elapsed_seconds || ""),
+        "Max RSS MB: " + (data.max_rss_mb || ""),
         "Error: " + (data.error || "")
       ];
       return lines.join("\\n");
@@ -384,6 +407,9 @@ Thumbnail: {render_thumbnail}</div>
       }}
       if (data.thumbnail_url) {{
         links.push('<a href="' + data.thumbnail_url + '" target="_blank">Open thumbnail.jpg</a>');
+      }}
+      if (data.youtube_url) {{
+        links.push('<a href="' + data.youtube_url + '" target="_blank">Open YouTube</a>');
       }}
       renderLinks.innerHTML = links.join(" &middot; ");
     }}
@@ -423,6 +449,37 @@ Thumbnail: {render_thumbnail}</div>
 
 
 class Handler(BaseHTTPRequestHandler):
+    def auto_start_render(self) -> None:
+        if not env_bool("AUTO_RENDER_ON_UPLOAD", True):
+            return
+        global render_process
+        if render_process and render_process.poll() is None:
+            return
+
+        OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+        log_path = OUTPUT_ROOT / "render-launch.log"
+        write_render_status(
+            {
+                "state": "queued",
+                "step": "launch",
+                "upload_dir": str(UPLOAD_DIR),
+                "output_root": str(OUTPUT_ROOT),
+                "log": str(log_path),
+                "trigger": "auto-upload",
+            }
+        )
+        script = Path(__file__).with_name("phone_render_worker.py")
+        env = os.environ.copy()
+        log_file = log_path.open("ab", buffering=0)
+        render_process = subprocess.Popen(
+            [sys.executable, str(script)],
+            cwd=str(script.parent),
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env=env,
+            close_fds=True,
+        )
+
     def do_GET(self) -> None:
         path = urlparse(self.path).path
         if path == "/render-status":
@@ -473,6 +530,7 @@ class Handler(BaseHTTPRequestHandler):
         with partial.open("wb") as out_file:
             shutil.copyfileobj(field.file, out_file, length=1024 * 1024)
         partial.rename(destination)
+        self.auto_start_render()
 
         if self.headers.get("X-Requested-With") == "XMLHttpRequest":
             payload = json.dumps(

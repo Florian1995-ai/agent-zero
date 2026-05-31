@@ -17,6 +17,8 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -24,9 +26,47 @@ from typing import Any
 
 UPLOAD_DIR = Path(os.getenv("AGENTZERO_UPLOAD_DIR", "/app/work_dir/assets/agentzero_uploads/shorts_test"))
 OUTPUT_ROOT = Path(os.getenv("AGENTZERO_OUTPUT_DIR", "/app/work_dir/assets/agentzero_outputs"))
+AUDIO_ASSET_DIR = Path(os.getenv("AGENTZERO_AUDIO_ASSET_DIR", "/app/work_dir/assets/agentzero_assets/audio"))
+YOUTUBE_CREDENTIALS_PATH = Path(os.getenv("YOUTUBE_CREDENTIALS_PATH", "/app/work_dir/assets/youtube/credentials.json"))
+YOUTUBE_TOKEN_PATH = Path(os.getenv("YOUTUBE_TOKEN_PATH", "/app/work_dir/assets/youtube/token.json"))
 STATE_FILE = OUTPUT_ROOT / "render_status.json"
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm"}
 PARTIAL_SUFFIXES = {".part", ".tmp", ".download", ".crdownload"}
+STAGE_TIMINGS: list[dict[str, Any]] = []
+EDITING_PRESET = {
+    "name": "agentzero_hostinger_v2_locked_silence_2026_05_31",
+    "description": "Locked preset from the first successful Hostinger phone render.",
+    "normalize": {
+        "width": 1080,
+        "height": 1920,
+        "fps": 30,
+        "video_codec": "libx264",
+        "preset": "veryfast",
+        "crf": 20,
+        "audio_codec": "aac",
+        "audio_bitrate": "192k",
+        "audio_loudnorm": "I=-16:TP=-1.5:LRA=11",
+    },
+    "silence_cut": {
+        "detector": "ffmpeg silencedetect",
+        "noise": "-28dB",
+        "duration": 0.18,
+        "padding_seconds": 0.035,
+        "min_kept_segment_seconds": 0.12,
+    },
+    "word_gap_fallback": {
+        "enabled": True,
+        "max_gap_seconds": 0.22,
+        "padding_seconds": 0.035,
+        "caption_timestamp_remap": True,
+    },
+    "captions": {
+        "style": "bold white uppercase with black outline",
+        "font": "Arial",
+        "font_size": 86,
+        "alignment": "lower third center",
+    },
+}
 
 
 def utc_now() -> str:
@@ -53,13 +93,35 @@ def write_status(**updates: Any) -> None:
     tmp.replace(STATE_FILE)
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def save_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=True), encoding="utf-8")
+
+
 def run(cmd: list[str], step: str, cwd: Path | None = None, capture: bool = False) -> subprocess.CompletedProcess[str]:
     print(f"[{step}] {' '.join(cmd)}", flush=True)
     write_status(step=step)
+    started = time.perf_counter()
     if capture:
         result = subprocess.run(cmd, cwd=str(cwd) if cwd else None, text=True, capture_output=True)
     else:
         result = subprocess.run(cmd, cwd=str(cwd) if cwd else None, text=True)
+    elapsed = round(time.perf_counter() - started, 3)
+    STAGE_TIMINGS.append({"step": step, "seconds": elapsed, "returncode": result.returncode})
     if result.returncode != 0:
         stderr = result.stderr[-4000:] if result.stderr else ""
         raise RuntimeError(f"{step} failed with exit code {result.returncode}\n{stderr}")
@@ -315,6 +377,43 @@ def ass_escape(text: str) -> str:
     return text.replace("{", "").replace("}", "").replace("\n", " ").strip()
 
 
+def plain_text_from_words(words: list[dict[str, Any]]) -> str:
+    return re.sub(r"\s+", " ", " ".join(str(word.get("word", "")).strip() for word in words)).strip()
+
+
+def shift_words(words: list[dict[str, Any]], offset: float) -> list[dict[str, Any]]:
+    shifted = []
+    for word in words:
+        if word.get("start") is None or word.get("end") is None:
+            continue
+        copy = dict(word)
+        copy["start"] = float(copy["start"]) + offset
+        copy["end"] = float(copy["end"]) + offset
+        shifted.append(copy)
+    return shifted
+
+
+def words_for_segments(words: list[dict[str, Any]], segments: list[tuple[float, float]]) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    offset = 0.0
+    for seg_start, seg_end in segments:
+        seg_duration = max(0.0, seg_end - seg_start)
+        for word in words:
+            if word.get("start") is None or word.get("end") is None:
+                continue
+            word_start = float(word["start"])
+            word_end = float(word["end"])
+            if word_end < seg_start or word_start > seg_end:
+                continue
+            copy = dict(word)
+            copy["start"] = offset + max(word_start, seg_start) - seg_start
+            copy["end"] = offset + min(word_end, seg_end) - seg_start
+            if copy["end"] > copy["start"]:
+                selected.append(copy)
+        offset += seg_duration
+    return selected
+
+
 def build_caption_groups(words: list[dict[str, Any]]) -> list[tuple[float, float, str]]:
     groups: list[tuple[float, float, str]] = []
     current: list[dict[str, Any]] = []
@@ -453,6 +552,518 @@ def remap_words_to_segments(words: list[dict[str, Any]], segments: list[tuple[fl
     return remapped
 
 
+def keyword_tags(text: str, limit: int = 8) -> list[str]:
+    stopwords = {
+        "about", "after", "again", "also", "and", "are", "because", "but", "can",
+        "for", "from", "have", "into", "just", "like", "that", "the", "this",
+        "was", "what", "when", "where", "with", "you", "your",
+    }
+    words = re.findall(r"[A-Za-z][A-Za-z0-9-]{2,}", text.lower())
+    counts: dict[str, int] = {}
+    for word in words:
+        if word in stopwords:
+            continue
+        counts[word] = counts.get(word, 0) + 1
+    return [word for word, _count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit]]
+
+
+def candidate_nuggets(words: list[dict[str, Any]], duration: float, limit: int = 8) -> list[dict[str, Any]]:
+    clean = [
+        word for word in words
+        if word.get("start") is not None and word.get("end") is not None and str(word.get("word", "")).strip()
+    ]
+    if not clean:
+        return []
+
+    hook_terms = {
+        "ai", "agent", "automate", "automation", "business", "client", "content",
+        "cost", "growth", "lead", "money", "offer", "pipeline", "result", "sales",
+        "system", "time", "video", "youtube",
+    }
+    candidates: list[dict[str, Any]] = []
+    window = 11
+    step = 6
+    for start_index in range(0, max(1, len(clean) - window + 1), step):
+        chunk = clean[start_index:start_index + window]
+        if len(chunk) < 4:
+            continue
+        start = max(0.0, float(chunk[0]["start"]) - 0.035)
+        end = min(duration, float(chunk[-1]["end"]) + 0.035)
+        clip_duration = end - start
+        if clip_duration < 1.2 or clip_duration > 4.0:
+            continue
+        text = plain_text_from_words(chunk)
+        lower = text.lower()
+        score = 1.0
+        score += sum(1.5 for term in hook_terms if term in lower)
+        score += 0.4 if "?" in text else 0
+        score += min(2.0, len(text) / 55)
+        candidates.append({"start": start, "end": end, "text": text, "score": round(score, 2)})
+
+    candidates.sort(key=lambda item: item["score"], reverse=True)
+    picked: list[dict[str, Any]] = []
+    for candidate in candidates:
+        overlaps = any(
+            not (candidate["end"] <= got["start"] or candidate["start"] >= got["end"])
+            for got in picked
+        )
+        if not overlaps:
+            picked.append(candidate)
+        if len(picked) >= limit:
+            break
+
+    if not picked and clean:
+        end_index = min(len(clean), 10)
+        picked.append({
+            "start": max(0.0, float(clean[0]["start"]) - 0.035),
+            "end": min(duration, float(clean[end_index - 1]["end"]) + 0.035),
+            "text": plain_text_from_words(clean[:end_index]),
+            "score": 1.0,
+        })
+    return picked
+
+
+def fallback_analysis(words: list[dict[str, Any]], duration: float, reason: str) -> dict[str, Any]:
+    text = plain_text_from_words(words)
+    first_sentence = re.split(r"(?<=[.!?])\s+", text)[0][:80].strip()
+    title = first_sentence or "AI Short"
+    tags = keyword_tags(text)
+    return {
+        "source": "local_fallback",
+        "reason": reason,
+        "title": title,
+        "description": (
+            f"{title}\n\n"
+            "Short-form clip rendered automatically by the AgentZero Hostinger pipeline."
+        ),
+        "tags": tags,
+        "nuggets": candidate_nuggets(words, duration, limit=3),
+        "hook": title,
+    }
+
+
+def estimate_openrouter_cost(prompt_chars: int, output_tokens: int = 900) -> dict[str, Any]:
+    prompt_tokens = max(1, int(prompt_chars / 4))
+    prompt_price_per_million = env_float("OPENROUTER_PROMPT_PRICE_PER_MILLION", 1.25)
+    completion_price_per_million = env_float("OPENROUTER_COMPLETION_PRICE_PER_MILLION", 10.0)
+    estimated = (prompt_tokens / 1_000_000 * prompt_price_per_million) + (
+        output_tokens / 1_000_000 * completion_price_per_million
+    )
+    return {
+        "prompt_tokens_estimate": prompt_tokens,
+        "completion_tokens_budget": output_tokens,
+        "estimated_cost_usd": round(estimated, 6),
+        "prompt_price_per_million": prompt_price_per_million,
+        "completion_price_per_million": completion_price_per_million,
+    }
+
+
+def parse_llm_json(content: str) -> dict[str, Any]:
+    content = content.strip()
+    if content.startswith("```"):
+        content = re.sub(r"^```(?:json)?", "", content).strip()
+        content = re.sub(r"```$", "", content).strip()
+    match = re.search(r"\{.*\}", content, flags=re.S)
+    if match:
+        content = match.group(0)
+    return json.loads(content)
+
+
+def normalize_nuggets(raw_nuggets: Any, words: list[dict[str, Any]], duration: float) -> list[dict[str, Any]]:
+    if not isinstance(raw_nuggets, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for item in raw_nuggets:
+        if not isinstance(item, dict):
+            continue
+        try:
+            start = max(0.0, min(duration, float(item.get("start", 0))))
+            end = max(start, min(duration, float(item.get("end", start + 2.0))))
+        except (TypeError, ValueError):
+            continue
+        if end - start < 0.8:
+            continue
+        normalized.append({
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "text": str(item.get("text", "")).strip(),
+            "reason": str(item.get("reason", "")).strip(),
+            "score": item.get("score", None),
+        })
+
+    picked: list[dict[str, Any]] = []
+    total = 0.0
+    for item in normalized[:5]:
+        length = item["end"] - item["start"]
+        if total >= 7.5:
+            break
+        if total + length > 8.5:
+            item = dict(item)
+            item["end"] = round(item["start"] + max(1.0, 8.0 - total), 3)
+            length = item["end"] - item["start"]
+        picked.append(item)
+        total += length
+
+    if not picked:
+        return candidate_nuggets(words, duration, limit=3)
+    return picked[:3]
+
+
+def analyze_transcript(words: list[dict[str, Any]], duration: float, job_dir: Path) -> dict[str, Any]:
+    provider = os.getenv("LLM_PROVIDER", "openrouter").strip().lower()
+    transcript_text = plain_text_from_words(words)
+    usage_path = job_dir / "llm_usage.json"
+
+    if provider in {"", "none", "off", "false"}:
+        analysis = fallback_analysis(words, duration, "LLM_PROVIDER disabled")
+        save_json(usage_path, {"provider": provider or "none", "used_llm": False, "reason": analysis["reason"]})
+        return analysis
+
+    if provider != "openrouter":
+        analysis = fallback_analysis(words, duration, f"Unsupported LLM_PROVIDER={provider}")
+        save_json(usage_path, {"provider": provider, "used_llm": False, "reason": analysis["reason"]})
+        return analysis
+
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        analysis = fallback_analysis(words, duration, "OPENROUTER_API_KEY missing")
+        save_json(usage_path, {"provider": "openrouter", "used_llm": False, "reason": analysis["reason"]})
+        return analysis
+
+    compact_words = [
+        {
+            "start": round(float(word.get("start", 0)), 2),
+            "end": round(float(word.get("end", 0)), 2),
+            "word": str(word.get("word", "")).strip(),
+        }
+        for word in words[:1800]
+        if str(word.get("word", "")).strip()
+    ]
+    prompt = (
+        "You are a senior YouTube Shorts editor. Analyze this transcript and return only valid JSON. "
+        "Choose 2-3 fast, high-value teaser nuggets for a GaryVee-style cold open. "
+        "Use word-safe timestamps from the supplied transcript. Also write a compelling YouTube Shorts title, "
+        "description, and tags. JSON schema: "
+        "{\"title\": string, \"description\": string, \"tags\": string[], "
+        "\"hook\": string, \"nuggets\": [{\"start\": number, \"end\": number, \"text\": string, "
+        "\"reason\": string, \"score\": number}]}\n\n"
+        f"Transcript text:\n{transcript_text[:12000]}\n\n"
+        f"Word timestamps JSON:\n{json.dumps(compact_words, ensure_ascii=True)}"
+    )
+    estimate = estimate_openrouter_cost(len(prompt))
+    max_cost = env_float("LLM_MAX_COST_PER_JOB_USD", 0.20)
+    if estimate["estimated_cost_usd"] > max_cost:
+        analysis = fallback_analysis(words, duration, "Estimated LLM cost above cap")
+        save_json(usage_path, {
+            "provider": "openrouter",
+            "used_llm": False,
+            "reason": analysis["reason"],
+            "estimate": estimate,
+            "max_cost_usd": max_cost,
+        })
+        return analysis
+
+    model = os.getenv("OPENROUTER_MODEL", "openai/gpt-5").strip() or "openai/gpt-5"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "Return strict JSON only. No markdown."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.4,
+        "max_tokens": 900,
+    }
+    request = urllib.request.Request(
+        "https://openrouter.ai/api/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://agent-zero-upload.2.24.108.202.sslip.io",
+            "X-Title": "AgentZero ShortForm Renderer",
+        },
+        method="POST",
+    )
+
+    write_status(step="llm-analysis", llm_model=model)
+    try:
+        with urllib.request.urlopen(request, timeout=90) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        content = data["choices"][0]["message"]["content"]
+        parsed = parse_llm_json(content)
+        parsed["source"] = "openrouter"
+        parsed["title"] = str(parsed.get("title") or fallback_analysis(words, duration, "missing title")["title"])[:100]
+        parsed["description"] = str(parsed.get("description") or "").strip()[:4500]
+        if not parsed["description"]:
+            parsed["description"] = fallback_analysis(words, duration, "missing description")["description"]
+        tags = parsed.get("tags")
+        if not isinstance(tags, list):
+            tags = keyword_tags(transcript_text)
+        parsed["tags"] = [str(tag).strip()[:40] for tag in tags if str(tag).strip()][:12]
+        parsed["nuggets"] = normalize_nuggets(parsed.get("nuggets"), words, duration)
+
+        usage = data.get("usage", {}) if isinstance(data, dict) else {}
+        actual_cost = usage.get("cost") or usage.get("total_cost") or data.get("cost")
+        save_json(usage_path, {
+            "provider": "openrouter",
+            "model": model,
+            "used_llm": True,
+            "estimate": estimate,
+            "max_cost_usd": max_cost,
+            "usage": usage,
+            "actual_cost_usd": actual_cost,
+        })
+        write_status(llm_status="complete", llm_model=model, llm_estimated_cost_usd=estimate["estimated_cost_usd"], llm_actual_cost_usd=actual_cost)
+        return parsed
+    except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError) as exc:
+        analysis = fallback_analysis(words, duration, f"OpenRouter failed: {exc}")
+        save_json(usage_path, {
+            "provider": "openrouter",
+            "model": model,
+            "used_llm": False,
+            "reason": analysis["reason"],
+            "estimate": estimate,
+        })
+        write_status(llm_status="fallback", llm_error=str(exc)[:400])
+        return analysis
+
+
+def build_intro_teaser(content_video: Path, words: list[dict[str, Any]], analysis: dict[str, Any], job_dir: Path) -> tuple[Path, list[dict[str, Any]], float, list[dict[str, Any]]]:
+    duration = ffprobe_duration(content_video)
+    nuggets = normalize_nuggets(analysis.get("nuggets"), words, duration)
+    if not nuggets:
+        nuggets = candidate_nuggets(words, duration, limit=3)
+    segments = [(float(item["start"]), float(item["end"])) for item in nuggets[:3]]
+    if not segments:
+        return content_video, [], 0.0, []
+
+    teaser = job_dir / "intro_teaser.mp4"
+    render_segments(content_video, teaser, segments, "intro-teaser")
+    teaser_duration = ffprobe_duration(teaser)
+    teaser_words = words_for_segments(words, segments)
+    save_json(job_dir / "intro_nuggets.json", {
+        "nuggets": nuggets[:3],
+        "segments": segments,
+        "duration": teaser_duration,
+        "source": analysis.get("source", "unknown"),
+    })
+    write_status(intro_teaser=str(teaser), intro_duration=round(teaser_duration, 2), intro_nuggets=len(segments))
+    return teaser, teaser_words, teaser_duration, nuggets[:3]
+
+
+def concat_intro_and_main(teaser: Path, main_video: Path, output_path: Path, job_dir: Path) -> None:
+    list_path = job_dir / "concat_intro_main.txt"
+    list_path.write_text(
+        f"file '{str(teaser).replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n"
+        f"file '{str(main_video).replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n",
+        encoding="utf-8",
+    )
+    run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_path),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ],
+        "concat-intro-main",
+    )
+
+
+def generate_test_audio_assets(asset_dir: Path) -> dict[str, Any]:
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    chime = asset_dir / "intro_chime_test.wav"
+    whoosh = asset_dir / "transition_whoosh_test.wav"
+    music = asset_dir / "music_bed_test.wav"
+
+    if not chime.exists():
+        run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=1174:duration=0.28",
+                "-af",
+                "afade=t=out:st=0.20:d=0.08,volume=0.35",
+                str(chime),
+            ],
+            "generate-intro-chime",
+        )
+    if not whoosh.exists():
+        run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "anoisesrc=color=pink:duration=0.55",
+                "-af",
+                "highpass=f=450,lowpass=f=4200,afade=t=in:st=0:d=0.08,afade=t=out:st=0.36:d=0.18,volume=0.22",
+                str(whoosh),
+            ],
+            "generate-whoosh",
+        )
+    if not music.exists():
+        run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=110:duration=180",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=220:duration=180",
+                "-filter_complex",
+                "[0:a]volume=0.025[a0];[1:a]volume=0.018[a1];[a0][a1]amix=inputs=2:duration=longest,afade=t=in:st=0:d=0.4",
+                str(music),
+            ],
+            "generate-music-bed",
+        )
+
+    manifest = {
+        "mode": "generated_test_assets",
+        "asset_dir": str(asset_dir),
+        "intro_chime": str(chime),
+        "transition_whoosh": str(whoosh),
+        "music_bed": str(music),
+        "note": "Original generated placeholders for architecture testing. Replace with licensed branded assets later.",
+        "candidate_sources": {
+            "intro_chime": "https://pixabay.com/sound-effects/notification-6175/",
+            "transition_whoosh": "https://pixabay.com/sound-effects/long-whoosh-194554/",
+            "music_bed": "https://pixabay.com/music/pulses-corporate-tech-loop-197118/",
+            "license_faq": "https://pixabay.com/service/faq/",
+        },
+    }
+    return manifest
+
+
+def resolve_audio_assets(job_dir: Path) -> dict[str, Any]:
+    AUDIO_ASSET_DIR.mkdir(parents=True, exist_ok=True)
+    configured = {
+        "intro_chime": Path(os.getenv("INTRO_CHIME_PATH", str(AUDIO_ASSET_DIR / "intro_chime.wav"))),
+        "transition_whoosh": Path(os.getenv("TRANSITION_WHOOSH_PATH", str(AUDIO_ASSET_DIR / "transition_whoosh.wav"))),
+        "music_bed": Path(os.getenv("MUSIC_BED_PATH", str(AUDIO_ASSET_DIR / "music_bed.wav"))),
+    }
+    if all(path.exists() for path in configured.values()):
+        manifest = {
+            "mode": "configured_assets",
+            "asset_dir": str(AUDIO_ASSET_DIR),
+            **{key: str(path) for key, path in configured.items()},
+            "note": "Using configured audio assets.",
+        }
+    else:
+        manifest = generate_test_audio_assets(AUDIO_ASSET_DIR)
+    save_json(job_dir / "asset_manifest.json", manifest)
+    write_status(audio_assets=manifest["mode"])
+    return manifest
+
+
+def mix_audio_bed(input_path: Path, output_path: Path, assets: dict[str, Any], teaser_duration: float) -> None:
+    chime = Path(assets.get("intro_chime", ""))
+    whoosh = Path(assets.get("transition_whoosh", ""))
+    music = Path(assets.get("music_bed", ""))
+    if not chime.exists() or not whoosh.exists() or not music.exists():
+        shutil.copy2(input_path, output_path)
+        write_status(audio_mix="skipped_missing_assets")
+        return
+
+    duration = ffprobe_duration(input_path)
+    whoosh_ms = max(0, int(max(0.0, teaser_duration - 0.18) * 1000))
+    filter_complex = (
+        "[0:a]aformat=sample_rates=48000:channel_layouts=stereo,volume=1.0[voice];"
+        f"[3:a]atrim=0:{duration:.3f},aformat=sample_rates=48000:channel_layouts=stereo,volume=0.055[music];"
+        "[music][voice]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=350[ducked];"
+        "[1:a]aformat=sample_rates=48000:channel_layouts=stereo,adelay=0|0,volume=0.26[chime];"
+        f"[2:a]aformat=sample_rates=48000:channel_layouts=stereo,adelay={whoosh_ms}|{whoosh_ms},volume=0.20[whoosh];"
+        "[voice][ducked][chime][whoosh]amix=inputs=4:duration=first:dropout_transition=0,alimiter=limit=0.95[aout]"
+    )
+    run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_path),
+            "-i",
+            str(chime),
+            "-i",
+            str(whoosh),
+            "-stream_loop",
+            "-1",
+            "-i",
+            str(music),
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "0:v",
+            "-map",
+            "[aout]",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ],
+        "audio-mix",
+    )
+    write_status(audio_mix="complete")
+
+
+def resource_snapshot(start_time: float) -> dict[str, Any]:
+    elapsed = round(time.perf_counter() - start_time, 3)
+    snapshot: dict[str, Any] = {
+        "elapsed_seconds": elapsed,
+        "stage_timings": STAGE_TIMINGS,
+    }
+    try:
+        import resource  # type: ignore
+
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        snapshot["process_user_cpu_seconds"] = round(float(usage.ru_utime), 3)
+        snapshot["process_system_cpu_seconds"] = round(float(usage.ru_stime), 3)
+        snapshot["process_max_rss_mb"] = round(float(usage.ru_maxrss) / 1024, 1)
+    except Exception as exc:
+        snapshot["resource_error"] = str(exc)[:200]
+    try:
+        import psutil  # type: ignore
+
+        vm = psutil.virtual_memory()
+        snapshot["system_memory_total_mb"] = round(vm.total / (1024 * 1024), 1)
+        snapshot["system_memory_available_mb"] = round(vm.available / (1024 * 1024), 1)
+        snapshot["system_cpu_count"] = psutil.cpu_count()
+        snapshot["system_cpu_percent_sample"] = psutil.cpu_percent(interval=0.2)
+    except Exception as exc:
+        snapshot["psutil_error"] = str(exc)[:200]
+    return snapshot
+
+
 def burn_captions_or_copy(input_path: Path, output_path: Path, captions_path: Path | None) -> None:
     if captions_path and captions_path.exists():
         run(
@@ -502,7 +1113,104 @@ def make_thumbnail(video_path: Path, output_path: Path) -> None:
     )
 
 
+def upload_to_youtube(video_path: Path, thumbnail_path: Path, metadata: dict[str, Any], job_dir: Path) -> dict[str, Any]:
+    status_path = job_dir / "upload_status.json"
+    enabled = env_bool("YOUTUBE_UPLOAD_ENABLED", True)
+    if not enabled:
+        status = {"state": "skipped", "reason": "YOUTUBE_UPLOAD_ENABLED=false"}
+        save_json(status_path, status)
+        write_status(youtube_status=status["state"], youtube_reason=status["reason"])
+        return status
+
+    title = str(metadata.get("title", "")).strip()
+    description = str(metadata.get("description", "")).strip()
+    if not title or not description:
+        status = {"state": "blocked", "reason": "metadata title/description missing"}
+        save_json(status_path, status)
+        write_status(youtube_status=status["state"], youtube_reason=status["reason"])
+        return status
+
+    if not YOUTUBE_TOKEN_PATH.exists():
+        status = {
+            "state": "skipped",
+            "reason": f"YouTube token missing: {YOUTUBE_TOKEN_PATH}",
+            "needed": "Create OAuth token.json with youtube.upload scope and mount it into assets/youtube.",
+        }
+        save_json(status_path, status)
+        write_status(youtube_status=status["state"], youtube_reason=status["reason"])
+        return status
+
+    try:
+        from google.oauth2.credentials import Credentials  # type: ignore
+        from google.auth.transport.requests import Request  # type: ignore
+        from googleapiclient.discovery import build  # type: ignore
+        from googleapiclient.http import MediaFileUpload  # type: ignore
+    except Exception as exc:
+        status = {
+            "state": "skipped",
+            "reason": f"YouTube Python dependencies missing: {exc}",
+        }
+        save_json(status_path, status)
+        write_status(youtube_status=status["state"], youtube_reason=status["reason"])
+        return status
+
+    write_status(step="youtube-upload", youtube_status="running")
+    try:
+        scopes = ["https://www.googleapis.com/auth/youtube.upload"]
+        credentials = Credentials.from_authorized_user_file(str(YOUTUBE_TOKEN_PATH), scopes=scopes)
+        if credentials.expired and credentials.refresh_token:
+            credentials.refresh(Request())
+            YOUTUBE_TOKEN_PATH.write_text(credentials.to_json(), encoding="utf-8")
+        if not credentials.valid:
+            raise RuntimeError("YouTube OAuth credentials are not valid")
+
+        youtube = build("youtube", "v3", credentials=credentials)
+        body = {
+            "snippet": {
+                "title": title[:100],
+                "description": description[:5000],
+                "tags": metadata.get("tags", [])[:15],
+                "categoryId": str(os.getenv("YOUTUBE_CATEGORY_ID", "27")),
+            },
+            "status": {
+                "privacyStatus": os.getenv("YOUTUBE_PRIVACY_STATUS", "public"),
+                "selfDeclaredMadeForKids": False,
+            },
+        }
+        media = MediaFileUpload(str(video_path), chunksize=-1, resumable=True, mimetype="video/mp4")
+        request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+        response = None
+        while response is None:
+            _status, response = request.next_chunk()
+        video_id = response["id"]
+
+        thumb_state = "skipped"
+        if thumbnail_path.exists():
+            youtube.thumbnails().set(
+                videoId=video_id,
+                media_body=MediaFileUpload(str(thumbnail_path), mimetype="image/jpeg"),
+            ).execute()
+            thumb_state = "uploaded"
+
+        status = {
+            "state": "uploaded",
+            "video_id": video_id,
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "privacy_status": body["status"]["privacyStatus"],
+            "thumbnail": thumb_state,
+        }
+        save_json(status_path, status)
+        write_status(youtube_status=status["state"], youtube_url=status["url"], youtube_privacy=status["privacy_status"])
+        return status
+    except Exception as exc:
+        status = {"state": "failed", "reason": str(exc)[:1000]}
+        save_json(status_path, status)
+        write_status(youtube_status=status["state"], youtube_reason=status["reason"])
+        return status
+
+
 def main() -> int:
+    render_started = time.perf_counter()
     write_status(state="running", started_at=utc_now(), upload_dir=str(UPLOAD_DIR), output_root=str(OUTPUT_ROOT))
     try:
         source, probe = newest_valid_upload()
@@ -513,59 +1221,95 @@ def main() -> int:
         raw_input = job_dir / f"raw_input{source.suffix.lower()}"
         normalized = job_dir / "normalized.mp4"
         edited = job_dir / "edited_base.mp4"
+        assembled = job_dir / "assembled_intro_main.mp4"
+        mixed = job_dir / "with_audio_bed.mp4"
         final = job_dir / "final.mp4"
         thumbnail = job_dir / "thumbnail.jpg"
 
         shutil.copy2(source, raw_input)
-        (job_dir / "input_probe.json").write_text(json.dumps(probe, indent=2, ensure_ascii=True), encoding="utf-8")
+        save_json(job_dir / "input_probe.json", probe)
+        save_json(job_dir / "editing_preset.json", EDITING_PRESET)
 
         normalize_video(raw_input, normalized)
         cut_count = cut_silences(normalized, edited, job_dir)
         captions, words = transcribe_and_write_captions(edited, job_dir)
-        caption_input = edited
+        content_video = edited
+        content_words = words
 
         if cut_count == 0 and words:
             duration_for_word_cuts = ffprobe_duration(edited)
             gap_segments = word_gap_segments(words, duration_for_word_cuts)
-            (job_dir / "word_gap_segments.json").write_text(
-                json.dumps(
-                    {
-                        "duration": duration_for_word_cuts,
-                        "segments": gap_segments,
-                        "cut_count": max(0, len(gap_segments) - 1),
-                    },
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
+            save_json(job_dir / "word_gap_segments.json", {
+                "duration": duration_for_word_cuts,
+                "segments": gap_segments,
+                "cut_count": max(0, len(gap_segments) - 1),
+            })
             if len(gap_segments) > 1:
                 word_gap_cut = job_dir / "word_gap_cut.mp4"
                 cut_count = render_segments(edited, word_gap_cut, gap_segments, "word-gap-cuts")
                 remapped_words = remap_words_to_segments(words, gap_segments)
-                (job_dir / "words_remapped.json").write_text(
-                    json.dumps(remapped_words, indent=2, ensure_ascii=True),
-                    encoding="utf-8",
-                )
-                captions = write_ass_captions(remapped_words, job_dir)
-                caption_input = word_gap_cut
+                save_json(job_dir / "words_remapped.json", remapped_words)
+                content_video = word_gap_cut
+                content_words = remapped_words
                 write_status(word_gap_cut=str(word_gap_cut), cut_count=cut_count)
 
-        burn_captions_or_copy(caption_input, final, captions)
+        content_duration = ffprobe_duration(content_video)
+        analysis = analyze_transcript(content_words, content_duration, job_dir)
+        save_json(job_dir / "title_description.json", {
+            "title": analysis.get("title", ""),
+            "description": analysis.get("description", ""),
+            "tags": analysis.get("tags", []),
+            "hook": analysis.get("hook", ""),
+            "source": analysis.get("source", "unknown"),
+        })
+        save_json(job_dir / "transcript_analysis.json", analysis)
+
+        teaser, teaser_words, teaser_duration, nuggets = build_intro_teaser(content_video, content_words, analysis, job_dir)
+        if teaser_words and teaser != content_video:
+            concat_intro_and_main(teaser, content_video, assembled, job_dir)
+            final_caption_words = teaser_words + shift_words(content_words, teaser_duration)
+        else:
+            shutil.copy2(content_video, assembled)
+            teaser_duration = 0.0
+            final_caption_words = content_words
+
+        assets = resolve_audio_assets(job_dir)
+        mix_audio_bed(assembled, mixed, assets, teaser_duration)
+        captions = write_ass_captions(final_caption_words, job_dir)
+        burn_captions_or_copy(mixed, final, captions)
         make_thumbnail(final, thumbnail)
 
         final_duration = ffprobe_duration(final)
+        youtube_metadata = {
+            "title": analysis.get("title", ""),
+            "description": analysis.get("description", ""),
+            "tags": analysis.get("tags", []),
+        }
+        upload_status = upload_to_youtube(final, thumbnail, youtube_metadata, job_dir)
+        resources = resource_snapshot(render_started)
+        save_json(job_dir / "resource_usage.json", resources)
         metadata = {
-            "privacy_status": "private",
-            "style": "tight jump cuts, bold burned-in short-form captions",
+            "privacy_status": os.getenv("YOUTUBE_PRIVACY_STATUS", "public"),
+            "style": "tight jump cuts, intro teaser, ducked music bed, bold burned-in short-form captions",
+            "editing_preset": EDITING_PRESET["name"],
             "source": str(source),
             "job_dir": str(job_dir),
             "final": str(final),
             "thumbnail": str(thumbnail),
+            "title": youtube_metadata["title"],
+            "description": youtube_metadata["description"],
+            "tags": youtube_metadata["tags"],
+            "intro_nuggets": nuggets,
             "duration": final_duration,
             "cut_count": cut_count,
+            "caption_count": len(build_caption_groups(final_caption_words)),
+            "asset_manifest": str(job_dir / "asset_manifest.json"),
+            "llm_usage": str(job_dir / "llm_usage.json"),
+            "upload_status": upload_status,
+            "resource_usage": resources,
             "completed_at": utc_now(),
         }
-        (job_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=True), encoding="utf-8")
+        save_json(job_dir / "metadata.json", metadata)
         write_status(
             state="complete",
             step="complete",
@@ -576,6 +1320,11 @@ def main() -> int:
             thumbnail_size_kb=round(thumbnail.stat().st_size / 1024, 1),
             duration=round(final_duration, 2),
             cut_count=cut_count,
+            intro_duration=round(teaser_duration, 2),
+            youtube_status=upload_status.get("state"),
+            youtube_url=upload_status.get("url", ""),
+            elapsed_seconds=resources.get("elapsed_seconds"),
+            max_rss_mb=resources.get("process_max_rss_mb"),
             completed_at=utc_now(),
         )
         print(f"[complete] {final}", flush=True)
