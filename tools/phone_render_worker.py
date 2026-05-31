@@ -1390,6 +1390,7 @@ def phrase_variants(phrase: str) -> list[str]:
     clean = phrase.strip().lower()
     if clean in {"4 factors", "four factors"}:
         variants = [
+            "there are four factors to consider when picking a market",
             "there are four factors to consider",
             "there are four factors",
             "four factors to consider",
@@ -1398,12 +1399,16 @@ def phrase_variants(phrase: str) -> list[str]:
         ]
     elif clean == "pain":
         variants = [
+            "the first one is is the market in pain",
+            "first one is is the market in pain",
             "is the market in pain",
             "market in pain",
             "pain",
         ]
     elif clean in {"market growing", "is the market growing"}:
         variants = [
+            "the third factor is is the market growing or is it declining",
+            "third factor is is the market growing or is it declining",
             "is the market growing or is it declining",
             "the market growing or is it declining",
             "is the market growing",
@@ -1426,11 +1431,11 @@ def find_phrase_segment(words: list[dict[str, Any]], phrase: str, duration: floa
         and normalized_word_token(str(word.get("word", "")))
     ]
     tokens = [normalized_word_token(str(word.get("word", ""))) for word in clean_words]
-    padding = cfg_float("rapid_intro", "padding_seconds", 0.045)
+    padding = cfg_float("rapid_intro", "padding_seconds", 0.035)
     pre_padding = cfg_float("rapid_intro", "pre_padding_seconds", padding)
     post_padding = cfg_float("rapid_intro", "post_padding_seconds", padding)
     min_clip = cfg_float("rapid_intro", "min_clip_seconds", 1.10)
-    max_clip = cfg_float("rapid_intro", "max_clip_seconds", 2.75)
+    max_clip = cfg_float("rapid_intro", "max_clip_seconds", 4.0)
 
     for variant in phrase_variants(phrase):
         phrase_tokens = [normalized_word_token(part) for part in variant.split() if normalized_word_token(part)]

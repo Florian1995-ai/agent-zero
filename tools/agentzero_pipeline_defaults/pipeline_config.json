@@ -49,11 +49,11 @@
       "market growing"
     ],
     "min_matches": 2,
-    "padding_seconds": 0.08,
-    "pre_padding_seconds": 0.06,
-    "post_padding_seconds": 0.08,
+    "padding_seconds": 0.035,
+    "pre_padding_seconds": 0.035,
+    "post_padding_seconds": 0.035,
     "min_clip_seconds": 1.1,
-    "max_clip_seconds": 2.75,
+    "max_clip_seconds": 4.0,
     "pause_after_clip_seconds": 0.0,
     "whoosh_after_cut_delay_seconds": 0.0
   },
