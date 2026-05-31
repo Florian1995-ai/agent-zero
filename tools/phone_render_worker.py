@@ -371,20 +371,40 @@ def speech_segments(
     return keep
 
 
+def segment_gaps_after(count: int, gap_after_seconds: Any) -> list[float]:
+    if count <= 0:
+        return []
+    if isinstance(gap_after_seconds, list):
+        gaps: list[float] = []
+        for index in range(count):
+            try:
+                value = float(gap_after_seconds[index]) if index < len(gap_after_seconds) else 0.0
+            except (TypeError, ValueError):
+                value = 0.0
+            gaps.append(max(0.0, value))
+        return gaps
+    try:
+        default_gap = max(0.0, float(gap_after_seconds))
+    except (TypeError, ValueError):
+        default_gap = 0.0
+    return [default_gap if index < count - 1 else 0.0 for index in range(count)]
+
+
 def render_segments(
     input_path: Path,
     output_path: Path,
     segments: list[tuple[float, float]],
     step: str,
-    gap_after_seconds: float = 0.0,
+    gap_after_seconds: Any = 0.0,
 ) -> int:
     if not segments:
         raise ValueError(f"{step} requires at least one segment")
 
+    gaps_after = segment_gaps_after(len(segments), gap_after_seconds)
     filters: list[str] = []
     concat_inputs: list[str] = []
     for index, (start, end) in enumerate(segments):
-        pause = max(0.0, gap_after_seconds) if index < len(segments) - 1 else 0.0
+        pause = gaps_after[index]
         duration = max(0.0, end - start) + pause
         video_filter = f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS"
         audio_filter = f"[0:a]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS"
@@ -507,9 +527,10 @@ def shift_words(words: list[dict[str, Any]], offset: float) -> list[dict[str, An
     return shifted
 
 
-def words_for_segments(words: list[dict[str, Any]], segments: list[tuple[float, float]], gap_after_seconds: float = 0.0) -> list[dict[str, Any]]:
+def words_for_segments(words: list[dict[str, Any]], segments: list[tuple[float, float]], gap_after_seconds: Any = 0.0) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     offset = 0.0
+    gaps_after = segment_gaps_after(len(segments), gap_after_seconds)
     for index, (seg_start, seg_end) in enumerate(segments):
         seg_duration = max(0.0, seg_end - seg_start)
         for word in words:
@@ -526,8 +547,7 @@ def words_for_segments(words: list[dict[str, Any]], segments: list[tuple[float, 
             if copy["end"] > copy["start"]:
                 selected.append(copy)
         offset += seg_duration
-        if index < len(segments) - 1:
-            offset += max(0.0, gap_after_seconds)
+        offset += gaps_after[index]
     return selected
 
 
@@ -1493,6 +1513,24 @@ def build_rapid_intro_segments(words: list[dict[str, Any]], duration: float) -> 
     return segments if len(segments) >= min_matches else []
 
 
+def rapid_intro_hold_after(nugget: dict[str, Any]) -> float:
+    holds = cfg("rapid_intro", "hold_after_phrase_seconds", {})
+    if not isinstance(holds, dict):
+        return 0.0
+    keys = [
+        str(nugget.get("phrase", "")).strip().lower(),
+        str(nugget.get("matched", "")).strip().lower(),
+        str(nugget.get("text", "")).strip().lower(),
+    ]
+    for key in keys:
+        if key in holds:
+            try:
+                return max(0.0, float(holds[key]))
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
+
+
 def concat_videos(paths: list[Path], output_path: Path, job_dir: Path, step: str) -> None:
     list_path = job_dir / f"{step}.txt"
     list_path.write_text(
@@ -1611,10 +1649,16 @@ def build_intro_teaser(content_video: Path, words: list[dict[str, Any]], analysi
         if phrase_nuggets:
             phrase_segments = [(float(item["start"]), float(item["end"])) for item in phrase_nuggets]
             pause_after_clip = cfg_float("rapid_intro", "pause_after_clip_seconds", 0.0)
+            hold_after_clips = [rapid_intro_hold_after(item) for item in phrase_nuggets]
+            if pause_after_clip > 0:
+                hold_after_clips = [
+                    hold + (pause_after_clip if index < len(phrase_nuggets) - 1 else 0.0)
+                    for index, hold in enumerate(hold_after_clips)
+                ]
             rapid_intro = job_dir / "rapid_phrase_intro.mp4"
-            render_segments(content_video, rapid_intro, phrase_segments, "rapid-phrase-intro", gap_after_seconds=pause_after_clip)
+            render_segments(content_video, rapid_intro, phrase_segments, "rapid-phrase-intro", gap_after_seconds=hold_after_clips)
             rapid_duration = ffprobe_duration(rapid_intro)
-            rapid_words = words_for_segments(words, phrase_segments, gap_after_seconds=pause_after_clip)
+            rapid_words = words_for_segments(words, phrase_segments, gap_after_seconds=hold_after_clips)
 
             sfx_events: list[dict[str, Any]] = []
             running = 0.0
@@ -1627,7 +1671,7 @@ def build_intro_teaser(content_video: Path, words: list[dict[str, Any]], analysi
                     "duration": cfg_float("audio", "rapid_cut_whoosh_duration", 0.42),
                     "label": "rapid_cut",
                 })
-                running += max(0.0, pause_after_clip)
+                running += hold_after_clips[index]
 
             intro_parts = [rapid_intro]
             logo_reveal, logo_duration = create_logo_reveal(job_dir)
@@ -1662,6 +1706,7 @@ def build_intro_teaser(content_video: Path, words: list[dict[str, Any]], analysi
                 "rapid_duration": rapid_duration,
                 "logo_duration": logo_duration,
                 "pause_after_clip_seconds": pause_after_clip,
+                "hold_after_clip_seconds": hold_after_clips,
                 "sfx_events": sfx_events,
                 "source": "configured_phrase_intro",
             })

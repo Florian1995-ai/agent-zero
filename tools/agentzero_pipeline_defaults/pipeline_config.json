@@ -54,6 +54,10 @@
     "post_padding_seconds": 0.035,
     "min_clip_seconds": 1.1,
     "max_clip_seconds": 4.0,
+    "hold_after_phrase_seconds": {
+      "pain": 0.28,
+      "market growing": 0.45
+    },
     "pause_after_clip_seconds": 0.0,
     "whoosh_after_cut_delay_seconds": 0.0
   },
@@ -83,7 +87,7 @@
     "rapid_cut_whoosh_duration": 0.42,
     "logo_whoosh_volume": 0.22,
     "logo_whoosh_duration": 1.05,
-    "logo_reveal_chime_volume": 0.56,
+    "logo_reveal_chime_volume": 1.12,
     "logo_reveal_chime_duration": 1.0,
     "music_volume": 0.055,
     "ducking_threshold": 0.03,
