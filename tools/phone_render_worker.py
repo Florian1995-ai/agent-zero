@@ -702,6 +702,189 @@ def candidate_nuggets(words: list[dict[str, Any]], duration: float, limit: int =
     return picked
 
 
+WEAK_NUGGET_STARTS = {
+    "and", "are", "as", "because", "but", "for", "if", "in", "is", "it",
+    "of", "or", "piece", "so", "that", "the", "then", "to", "was", "we",
+}
+
+SUSPECT_TRANSCRIPT_PHRASES = {
+    " dust ",
+    " market air ",
+    " the ready",
+}
+
+VALUE_NUGGET_TERMS = {
+    "ai", "agency", "business", "client", "factor", "factors", "find",
+    "four", "growing", "lead", "market", "money", "pain", "reach",
+    "spend", "system", "youtube",
+}
+
+
+def text_word_count(text: str) -> int:
+    return len(re.findall(r"[A-Za-z0-9][A-Za-z0-9'-]*", text))
+
+
+def nugget_first_word(text: str) -> str:
+    match = re.search(r"[A-Za-z0-9][A-Za-z0-9'-]*", text.lower())
+    return match.group(0) if match else ""
+
+
+def words_in_time_range(words: list[dict[str, Any]], start: float, end: float) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    for word in words:
+        if word.get("start") is None or word.get("end") is None:
+            continue
+        word_start = float(word["start"])
+        word_end = float(word["end"])
+        if word_end < start or word_start > end:
+            continue
+        selected.append(word)
+    return selected
+
+
+def score_coherent_nugget(text: str, start: float, end: float) -> float:
+    lower = text.lower()
+    score = 1.0 + min(2.0, text_word_count(text) / 8)
+    score += sum(1.1 for term in VALUE_NUGGET_TERMS if term in lower)
+    if text.rstrip().endswith((".", "?", "!")):
+        score += 1.0
+    if nugget_first_word(text) in WEAK_NUGGET_STARTS:
+        score -= 1.2
+    clip_duration = end - start
+    if 2.0 <= clip_duration <= 5.5:
+        score += 0.8
+    if clip_duration > 7.0:
+        score -= 0.9
+    if any(phrase in f" {lower} " for phrase in SUSPECT_TRANSCRIPT_PHRASES):
+        score -= 4.0
+    return round(score, 2)
+
+
+def add_coherent_candidate(
+    candidates: list[dict[str, Any]],
+    chunk: list[dict[str, Any]],
+    duration: float,
+) -> None:
+    if not chunk:
+        return
+    start = max(0.0, float(chunk[0]["start"]) - 0.035)
+    end = min(duration, float(chunk[-1]["end"]) + 0.035)
+    text = plain_text_from_words(chunk)
+    word_count = text_word_count(text)
+    if word_count < 5 or end - start < 1.4:
+        return
+    probabilities = [
+        float(word.get("probability", 1.0))
+        for word in chunk
+        if word.get("probability") is not None
+    ]
+    avg_probability = sum(probabilities) / len(probabilities) if probabilities else 1.0
+    score = score_coherent_nugget(text, start, end)
+    if avg_probability < 0.8:
+        score -= 1.5
+    if avg_probability < 0.65:
+        score -= 2.0
+    candidates.append({
+        "start": round(start, 3),
+        "end": round(end, 3),
+        "text": text,
+        "score": round(score, 2),
+        "avg_word_probability": round(avg_probability, 3),
+    })
+
+
+def coherent_nugget_candidates(words: list[dict[str, Any]], duration: float, limit: int = 10) -> list[dict[str, Any]]:
+    clean = [
+        word for word in words
+        if word.get("start") is not None and word.get("end") is not None and str(word.get("word", "")).strip()
+    ]
+    if not clean:
+        return []
+
+    candidates: list[dict[str, Any]] = []
+    group: list[dict[str, Any]] = []
+    for index, word in enumerate(clean):
+        group.append(word)
+        text = str(word.get("word", "")).strip()
+        next_word = clean[index + 1] if index + 1 < len(clean) else None
+        gap = 0.0
+        if next_word:
+            gap = max(0.0, float(next_word["start"]) - float(word["end"]))
+        terminal = text.endswith((".", "?", "!"))
+        long_group = len(group) >= 18
+        if terminal or gap > 0.55 or long_group:
+            add_coherent_candidate(candidates, group, duration)
+            if len(group) > 12:
+                add_coherent_candidate(candidates, group[:12], duration)
+                add_coherent_candidate(candidates, group[-12:], duration)
+            group = []
+    add_coherent_candidate(candidates, group, duration)
+
+    candidates.extend(candidate_nuggets(words, duration, limit=limit))
+    deduped: list[dict[str, Any]] = []
+    for item in sorted(candidates, key=lambda got: got["score"], reverse=True):
+        overlaps = any(
+            not (item["end"] <= got["start"] or item["start"] >= got["end"])
+            for got in deduped
+        )
+        if not overlaps:
+            deduped.append(item)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def nugget_quality_issue(item: dict[str, Any], words: list[dict[str, Any]]) -> str:
+    selected_words = words_in_time_range(words, float(item["start"]), float(item["end"]))
+    text = plain_text_from_words(selected_words) or str(item.get("text", "")).strip()
+    lower = f" {text.lower()} "
+    word_count = text_word_count(text)
+    first_word = nugget_first_word(text)
+    if word_count < 7:
+        return "too few words"
+    if first_word in WEAK_NUGGET_STARTS:
+        return f"weak start word: {first_word}"
+    if text.rstrip().endswith((",", ";", ":", "and", "or", "to")):
+        return "trailing incomplete phrase"
+    if any(phrase in lower for phrase in SUSPECT_TRANSCRIPT_PHRASES):
+        return "suspect transcript phrase"
+    return ""
+
+
+def guard_nuggets(
+    nuggets: list[dict[str, Any]],
+    words: list[dict[str, Any]],
+    duration: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    local_candidates = coherent_nugget_candidates(words, duration, limit=8)
+    kept: list[dict[str, Any]] = []
+    replacements: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+
+    for item in nuggets:
+        issue = nugget_quality_issue(item, words)
+        if issue:
+            rejected.append({"nugget": item, "reason": issue})
+            continue
+        kept.append(item)
+
+    for candidate in local_candidates:
+        if len(kept) >= cfg_int("intro_teaser", "max_nuggets", 3):
+            break
+        overlaps = any(
+            not (candidate["end"] <= got["start"] or candidate["start"] >= got["end"])
+            for got in kept
+        )
+        if overlaps:
+            continue
+        replacement = dict(candidate)
+        replacement["reason"] = replacement.get("reason", "Local coherence guard replacement")
+        kept.append(replacement)
+        replacements.append(replacement)
+
+    return kept, {"rejected": rejected, "replacements": replacements}
+
+
 def fallback_analysis(words: list[dict[str, Any]], duration: float, reason: str) -> dict[str, Any]:
     text = plain_text_from_words(words)
     first_sentence = re.split(r"(?<=[.!?])\s+", text)[0][:80].strip()
@@ -716,7 +899,7 @@ def fallback_analysis(words: list[dict[str, Any]], duration: float, reason: str)
             "Short-form clip rendered automatically by the AgentZero Hostinger pipeline."
         ),
         "tags": tags,
-        "nuggets": candidate_nuggets(words, duration, limit=3),
+        "nuggets": coherent_nugget_candidates(words, duration, limit=3) or candidate_nuggets(words, duration, limit=3),
         "hook": title,
     }
 
@@ -887,6 +1070,16 @@ def normalize_analysis(parsed: dict[str, Any], words: list[dict[str, Any]], dura
     parsed["tags"] = [str(tag).strip()[:40] for tag in tags if str(tag).strip()][:12]
     parsed["hook"] = str(parsed.get("hook") or parsed["title"]).strip()[:180]
     parsed["nuggets"] = normalize_nuggets(parsed.get("nuggets"), words, duration)
+    guarded_nuggets, guard_events = guard_nuggets(parsed["nuggets"], words, duration)
+    parsed["nuggets"] = normalize_nuggets(guarded_nuggets, words, duration)
+    final_windows = {(item["start"], item["end"]) for item in parsed["nuggets"]}
+    guard_events["replacements"] = [
+        item for item in guard_events["replacements"]
+        if (item["start"], item["end"]) in final_windows
+    ]
+    if guard_events["rejected"] or guard_events["replacements"]:
+        parsed["source"] = "openrouter_with_local_nugget_guard"
+        parsed["nugget_guard"] = guard_events
     if len(parsed["nuggets"]) < 2:
         raise ValueError("OpenRouter returned too few usable nuggets")
     return parsed
@@ -925,8 +1118,11 @@ def normalize_nuggets(raw_nuggets: Any, words: list[dict[str, Any]], duration: f
         if total >= max(0.8, target_seconds - 0.5):
             break
         if total + length > max_seconds:
+            remaining = target_seconds - total
+            if remaining < 1.8:
+                break
             item = dict(item)
-            item["end"] = round(item["start"] + max(1.0, target_seconds - total), 3)
+            item["end"] = round(item["start"] + max(1.8, remaining), 3)
             length = item["end"] - item["start"]
         picked.append(item)
         total += length
@@ -966,6 +1162,7 @@ def analyze_transcript(words: list[dict[str, Any]], duration: float, job_dir: Pa
         for word in words[:1800]
         if str(word.get("word", "")).strip()
     ]
+    coherent_candidates = coherent_nugget_candidates(words, duration, limit=12)
     deterministic_candidates = candidate_nuggets(words, duration, limit=12)
     prompt = (
         "You are a senior short-form editor cutting talking-head business content for YouTube Shorts.\n"
@@ -983,7 +1180,8 @@ def analyze_transcript(words: list[dict[str, Any]], duration: float, job_dir: Pa
         "{\"title\": string, \"description\": string, \"tags\": string[], "
         "\"hook\": string, \"nuggets\": [{\"start\": number, \"end\": number, \"text\": string, "
         "\"reason\": string, \"score\": number}]}\n\n"
-        f"Deterministic candidate nugget windows, use or refine these when they are strong:\n{json.dumps(deterministic_candidates, ensure_ascii=True)}\n\n"
+        f"Coherent candidate clips, strongly prefer these exact windows:\n{json.dumps(coherent_candidates, ensure_ascii=True)}\n\n"
+        f"Lower-confidence deterministic windows, use only if they are clearly better:\n{json.dumps(deterministic_candidates, ensure_ascii=True)}\n\n"
         f"Transcript text:\n{transcript_text[:12000]}\n\n"
         f"Word timestamps JSON:\n{json.dumps(compact_words, ensure_ascii=True)}"
     )
