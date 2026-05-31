@@ -17,6 +17,14 @@ if [ -d /git/agent-zero/tools/agentzero_pipeline_defaults ]; then
   cp -R /git/agent-zero/tools/agentzero_pipeline_defaults/. "$AGENTZERO_PIPELINE_DIR/defaults/"
 fi
 
+if [ -d "$AGENTZERO_PIPELINE_DIR/defaults/audio" ]; then
+  cp -Rn "$AGENTZERO_PIPELINE_DIR/defaults/audio/." "$AGENTZERO_PIPELINE_DIR/audio/" 2>/dev/null || true
+fi
+
+if [ -d "$AGENTZERO_PIPELINE_DIR/defaults/logo" ]; then
+  cp -Rn "$AGENTZERO_PIPELINE_DIR/defaults/logo/." "$AGENTZERO_PIPELINE_DIR/logo/" 2>/dev/null || true
+fi
+
 if [ "$AGENTZERO_PIPELINE_SYNC_CODE" = "true" ] || [ "$AGENTZERO_PIPELINE_SYNC_CODE" = "1" ]; then
   cp "$AGENTZERO_PIPELINE_DIR/defaults/phone_upload_server.py" "$AGENTZERO_PIPELINE_DIR/phone_upload_server.py"
   cp "$AGENTZERO_PIPELINE_DIR/defaults/phone_render_worker.py" "$AGENTZERO_PIPELINE_DIR/phone_render_worker.py"

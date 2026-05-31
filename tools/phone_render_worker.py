@@ -88,6 +88,16 @@ def cfg_bool(section: str, key: str, default: bool) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def rebase_pipeline_path(value: Any, fallback: Path) -> Path:
+    path = Path(str(value)) if value else fallback
+    old_default = Path("/app/work_dir/assets/agentzero_pipeline")
+    try:
+        relative = path.relative_to(old_default)
+    except ValueError:
+        return path
+    return PIPELINE_DIR / relative
+
+
 EDITING_PRESET = {
     "name": "agentzero_hostinger_v2_locked_silence_2026_05_31",
     "description": "Locked preset from the first successful Hostinger phone render.",
@@ -125,7 +135,8 @@ EDITING_PRESET = {
 if isinstance(PIPELINE_CONFIG.get("editing_preset"), dict):
     EDITING_PRESET = deep_merge(EDITING_PRESET, PIPELINE_CONFIG["editing_preset"])
 
-AUDIO_ASSET_DIR = Path(os.getenv("AGENTZERO_AUDIO_ASSET_DIR", str(cfg("audio", "asset_dir", PIPELINE_DIR / "audio"))))
+AUDIO_ASSET_DIR = Path(os.getenv("AGENTZERO_AUDIO_ASSET_DIR", str(rebase_pipeline_path(cfg("audio", "asset_dir", PIPELINE_DIR / "audio"), PIPELINE_DIR / "audio"))))
+LOGO_ASSET_DIR = Path(os.getenv("AGENTZERO_LOGO_ASSET_DIR", str(rebase_pipeline_path(cfg("logo", "asset_dir", PIPELINE_DIR / "logo"), PIPELINE_DIR / "logo"))))
 YOUTUBE_CREDENTIALS_PATH = Path(os.getenv("YOUTUBE_CREDENTIALS_PATH", str(cfg("youtube", "credentials_path", "/app/work_dir/assets/youtube/credentials.json"))))
 YOUTUBE_TOKEN_PATH = Path(os.getenv("YOUTUBE_TOKEN_PATH", str(cfg("youtube", "token_path", "/app/work_dir/assets/youtube/token.json"))))
 
@@ -482,7 +493,7 @@ def words_for_segments(words: list[dict[str, Any]], segments: list[tuple[float, 
                 continue
             word_start = float(word["start"])
             word_end = float(word["end"])
-            if word_end < seg_start or word_start > seg_end:
+            if word_end <= seg_start or word_start >= seg_end:
                 continue
             copy = dict(word)
             copy["start"] = offset + max(word_start, seg_start) - seg_start
@@ -740,7 +751,7 @@ def words_in_time_range(words: list[dict[str, Any]], start: float, end: float) -
             continue
         word_start = float(word["start"])
         word_end = float(word["end"])
-        if word_end < start or word_start > end:
+        if word_end <= start or word_start >= end:
             continue
         selected.append(word)
     return selected
@@ -1329,40 +1340,94 @@ def analyze_transcript(words: list[dict[str, Any]], duration: float, job_dir: Pa
     return analysis
 
 
-def build_intro_teaser(content_video: Path, words: list[dict[str, Any]], analysis: dict[str, Any], job_dir: Path) -> tuple[Path, list[dict[str, Any]], float, list[dict[str, Any]]]:
-    if not cfg_bool("intro_teaser", "enabled", True):
-        save_json(job_dir / "intro_nuggets.json", {"enabled": False, "nuggets": [], "segments": [], "duration": 0.0})
-        write_status(intro_teaser="", intro_duration=0.0, intro_nuggets=0)
-        return content_video, [], 0.0, []
-
-    duration = ffprobe_duration(content_video)
-    max_nuggets = cfg_int("intro_teaser", "max_nuggets", 3)
-    nuggets = normalize_nuggets(analysis.get("nuggets"), words, duration)
-    if not nuggets:
-        nuggets = candidate_nuggets(words, duration, limit=max_nuggets)
-    segments = [(float(item["start"]), float(item["end"])) for item in nuggets[:max_nuggets]]
-    if not segments:
-        return content_video, [], 0.0, []
-
-    teaser = job_dir / "intro_teaser.mp4"
-    render_segments(content_video, teaser, segments, "intro-teaser")
-    teaser_duration = ffprobe_duration(teaser)
-    teaser_words = words_for_segments(words, segments)
-    save_json(job_dir / "intro_nuggets.json", {
-        "nuggets": nuggets[:max_nuggets],
-        "segments": segments,
-        "duration": teaser_duration,
-        "source": analysis.get("source", "unknown"),
-    })
-    write_status(intro_teaser=str(teaser), intro_duration=round(teaser_duration, 2), intro_nuggets=len(segments))
-    return teaser, teaser_words, teaser_duration, nuggets[:max_nuggets]
+def normalized_word_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
 
 
-def concat_intro_and_main(teaser: Path, main_video: Path, output_path: Path, job_dir: Path) -> None:
-    list_path = job_dir / "concat_intro_main.txt"
+def phrase_variants(phrase: str) -> list[str]:
+    clean = phrase.strip().lower()
+    if clean in {"4 factors", "four factors"}:
+        variants = ["four factors", "4 factors"]
+    elif clean == "pain":
+        variants = ["market in pain", "pain"]
+    elif clean in {"market growing", "is the market growing"}:
+        variants = ["is the market growing", "market growing"]
+    else:
+        variants = [clean]
+    deduped: list[str] = []
+    for item in variants:
+        if item and item not in deduped:
+            deduped.append(item)
+    return deduped
+
+
+def find_phrase_segment(words: list[dict[str, Any]], phrase: str, duration: float) -> dict[str, Any] | None:
+    clean_words = [
+        word for word in words
+        if word.get("start") is not None
+        and word.get("end") is not None
+        and normalized_word_token(str(word.get("word", "")))
+    ]
+    tokens = [normalized_word_token(str(word.get("word", ""))) for word in clean_words]
+    padding = cfg_float("rapid_intro", "padding_seconds", 0.045)
+    min_clip = cfg_float("rapid_intro", "min_clip_seconds", 0.42)
+    max_clip = cfg_float("rapid_intro", "max_clip_seconds", 1.15)
+
+    for variant in phrase_variants(phrase):
+        phrase_tokens = [normalized_word_token(part) for part in variant.split() if normalized_word_token(part)]
+        if not phrase_tokens:
+            continue
+        for index in range(0, max(0, len(tokens) - len(phrase_tokens) + 1)):
+            if tokens[index:index + len(phrase_tokens)] != phrase_tokens:
+                continue
+            phrase_end_index = index + len(phrase_tokens) - 1
+            start = max(0.0, float(clean_words[index]["start"]) - padding)
+            end = min(duration, float(clean_words[phrase_end_index]["end"]) + padding)
+            if index > 0:
+                start = max(start, float(clean_words[index - 1]["end"]))
+            if phrase_end_index + 1 < len(clean_words):
+                end = min(end, float(clean_words[phrase_end_index + 1]["start"]))
+            while end - start < min_clip and index + len(phrase_tokens) < len(clean_words):
+                next_index = index + len(phrase_tokens)
+                end = min(duration, float(clean_words[next_index]["end"]) + padding)
+                if next_index + 1 < len(clean_words):
+                    end = min(end, float(clean_words[next_index + 1]["start"]))
+                phrase_tokens.append(tokens[index + len(phrase_tokens)])
+            if end - start > max_clip:
+                end = min(duration, start + max_clip)
+            segment_words = words_in_time_range(words, start, end)
+            return {
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "text": plain_text_from_words(segment_words),
+                "phrase": phrase,
+                "matched": variant,
+            }
+    return None
+
+
+def build_rapid_intro_segments(words: list[dict[str, Any]], duration: float) -> list[dict[str, Any]]:
+    phrases = cfg("rapid_intro", "phrases", ["four factors", "pain", "market growing"])
+    if isinstance(phrases, str):
+        phrases = [item.strip() for item in phrases.split(",") if item.strip()]
+    if not isinstance(phrases, list):
+        return []
+    segments: list[dict[str, Any]] = []
+    for phrase in phrases:
+        found = find_phrase_segment(words, str(phrase), duration)
+        if found:
+            segments.append(found)
+    min_matches = cfg_int("rapid_intro", "min_matches", 2)
+    return segments if len(segments) >= min_matches else []
+
+
+def concat_videos(paths: list[Path], output_path: Path, job_dir: Path, step: str) -> None:
+    list_path = job_dir / f"{step}.txt"
     list_path.write_text(
-        f"file '{str(teaser).replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n"
-        f"file '{str(main_video).replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n",
+        "".join(
+            f"file '{str(path).replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n"
+            for path in paths
+        ),
         encoding="utf-8",
     )
     run(
@@ -1389,8 +1454,169 @@ def concat_intro_and_main(teaser: Path, main_video: Path, output_path: Path, job
             "+faststart",
             str(output_path),
         ],
-        "concat-intro-main",
+        step,
     )
+
+
+def create_logo_reveal(job_dir: Path) -> tuple[Path | None, float]:
+    if not cfg_bool("logo", "enabled", False):
+        return None, 0.0
+    logo_path = Path(os.getenv("LOGO_ANIMATION_PATH", str(rebase_pipeline_path(cfg("logo", "animation_path", LOGO_ASSET_DIR / "florian-rolke-logo.png"), LOGO_ASSET_DIR / "florian-rolke-logo.png"))))
+    if not logo_path.exists():
+        logo_path = Path(os.getenv("LOGO_IMAGE_PATH", str(rebase_pipeline_path(cfg("logo", "image_path", LOGO_ASSET_DIR / "florian-rolke-logo.png"), LOGO_ASSET_DIR / "florian-rolke-logo.png"))))
+    if not logo_path.exists():
+        write_status(logo_reveal="skipped_missing_logo")
+        return None, 0.0
+
+    reveal = job_dir / "logo_reveal.mp4"
+    reveal_duration = cfg_float("logo", "reveal_duration", 1.15)
+    width = cfg_int("editing_preset", "width", int(EDITING_PRESET.get("normalize", {}).get("width", 1080)))
+    height = cfg_int("editing_preset", "height", int(EDITING_PRESET.get("normalize", {}).get("height", 1920)))
+    fps = cfg_int("editing_preset", "fps", int(EDITING_PRESET.get("normalize", {}).get("fps", 30)))
+    logo_width = cfg_int("logo", "width", 650)
+    background = str(cfg("logo", "background", "0xf5f8fb"))
+    fly_seconds = max(0.12, cfg_float("logo", "fly_seconds", 0.42))
+    overlay_x = f"if(gte(t\\,{fly_seconds:.3f})\\,(W-w)/2\\,-w+((W-w)/2+w)*t/{fly_seconds:.3f})"
+    filter_complex = (
+        f"[1:v]format=rgba,scale={logo_width}:-1,"
+        "fade=t=in:st=0.04:d=0.16:alpha=1[logo];"
+        f"[0:v][logo]overlay=x='{overlay_x}':y='(H-h)/2':format=auto[v];"
+        f"anullsrc=r=48000:cl=stereo,atrim=0:{reveal_duration:.3f}[a]"
+    )
+    run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c={background}:s={width}x{height}:r={fps}:d={reveal_duration:.3f}",
+            "-loop",
+            "1",
+            "-t",
+            f"{reveal_duration:.3f}",
+            "-i",
+            str(logo_path),
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "[v]",
+            "-map",
+            "[a]",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            str(reveal),
+        ],
+        "logo-reveal",
+    )
+    duration = ffprobe_duration(reveal)
+    write_status(logo_reveal=str(reveal), logo_reveal_duration=round(duration, 2))
+    return reveal, duration
+
+
+def build_intro_teaser(content_video: Path, words: list[dict[str, Any]], analysis: dict[str, Any], job_dir: Path) -> tuple[Path, list[dict[str, Any]], float, list[dict[str, Any]], list[dict[str, Any]]]:
+    if not cfg_bool("intro_teaser", "enabled", True):
+        save_json(job_dir / "intro_nuggets.json", {"enabled": False, "nuggets": [], "segments": [], "duration": 0.0})
+        write_status(intro_teaser="", intro_duration=0.0, intro_nuggets=0)
+        return content_video, [], 0.0, [], []
+
+    duration = ffprobe_duration(content_video)
+    if cfg_bool("rapid_intro", "enabled", False):
+        phrase_nuggets = build_rapid_intro_segments(words, duration)
+        if phrase_nuggets:
+            phrase_segments = [(float(item["start"]), float(item["end"])) for item in phrase_nuggets]
+            rapid_intro = job_dir / "rapid_phrase_intro.mp4"
+            render_segments(content_video, rapid_intro, phrase_segments, "rapid-phrase-intro")
+            rapid_duration = ffprobe_duration(rapid_intro)
+            rapid_words = words_for_segments(words, phrase_segments)
+
+            sfx_events: list[dict[str, Any]] = []
+            running = 0.0
+            for index, (start, end) in enumerate(phrase_segments[:-1]):
+                running += max(0.0, end - start)
+                sfx_events.append({
+                    "asset": "rapid_cut_whoosh",
+                    "time": max(0.0, running - cfg_float("rapid_intro", "whoosh_pre_roll", 0.08)),
+                    "volume": cfg_float("audio", "rapid_cut_whoosh_volume", 0.18),
+                    "duration": cfg_float("audio", "rapid_cut_whoosh_duration", 0.42),
+                    "label": "rapid_cut",
+                })
+
+            intro_parts = [rapid_intro]
+            logo_reveal, logo_duration = create_logo_reveal(job_dir)
+            if logo_reveal:
+                sfx_events.append({
+                    "asset": "logo_whoosh",
+                    "time": max(0.0, rapid_duration - cfg_float("logo", "swoosh_pre_roll", 0.05)),
+                    "volume": cfg_float("audio", "logo_whoosh_volume", 0.22),
+                    "duration": cfg_float("audio", "logo_whoosh_duration", 1.05),
+                    "label": "logo_fly_in",
+                })
+                sfx_events.append({
+                    "asset": "logo_reveal_chime",
+                    "time": rapid_duration + cfg_float("logo", "chime_offset", 0.36),
+                    "volume": cfg_float("audio", "logo_reveal_chime_volume", 0.30),
+                    "duration": cfg_float("audio", "logo_reveal_chime_duration", 1.0),
+                    "label": "logo_reveal",
+                })
+                intro_parts.append(logo_reveal)
+
+            teaser = job_dir / "intro_teaser.mp4"
+            if len(intro_parts) > 1:
+                concat_videos(intro_parts, teaser, job_dir, "concat-rapid-logo-intro")
+            else:
+                shutil.copy2(rapid_intro, teaser)
+            teaser_duration = ffprobe_duration(teaser)
+            save_json(job_dir / "intro_nuggets.json", {
+                "mode": "rapid_phrase_intro",
+                "nuggets": phrase_nuggets,
+                "segments": phrase_segments,
+                "duration": teaser_duration,
+                "rapid_duration": rapid_duration,
+                "logo_duration": logo_duration,
+                "sfx_events": sfx_events,
+                "source": "configured_phrase_intro",
+            })
+            write_status(intro_teaser=str(teaser), intro_duration=round(teaser_duration, 2), intro_nuggets=len(phrase_segments))
+            return teaser, rapid_words, teaser_duration, phrase_nuggets, sfx_events
+
+    max_nuggets = cfg_int("intro_teaser", "max_nuggets", 3)
+    nuggets = normalize_nuggets(analysis.get("nuggets"), words, duration)
+    if not nuggets:
+        nuggets = candidate_nuggets(words, duration, limit=max_nuggets)
+    segments = [(float(item["start"]), float(item["end"])) for item in nuggets[:max_nuggets]]
+    if not segments:
+        return content_video, [], 0.0, [], []
+
+    teaser = job_dir / "intro_teaser.mp4"
+    render_segments(content_video, teaser, segments, "intro-teaser")
+    teaser_duration = ffprobe_duration(teaser)
+    teaser_words = words_for_segments(words, segments)
+    save_json(job_dir / "intro_nuggets.json", {
+        "nuggets": nuggets[:max_nuggets],
+        "segments": segments,
+        "duration": teaser_duration,
+        "source": analysis.get("source", "unknown"),
+    })
+    write_status(intro_teaser=str(teaser), intro_duration=round(teaser_duration, 2), intro_nuggets=len(segments))
+    return teaser, teaser_words, teaser_duration, nuggets[:max_nuggets], []
+
+
+def concat_intro_and_main(teaser: Path, main_video: Path, output_path: Path, job_dir: Path) -> None:
+    concat_videos([teaser, main_video], output_path, job_dir, "concat-intro-main")
 
 
 def generate_test_audio_assets(asset_dir: Path) -> dict[str, Any]:
@@ -1469,25 +1695,49 @@ def generate_test_audio_assets(asset_dir: Path) -> dict[str, Any]:
 def resolve_audio_assets(job_dir: Path) -> dict[str, Any]:
     AUDIO_ASSET_DIR.mkdir(parents=True, exist_ok=True)
     configured = {
-        "intro_chime": Path(os.getenv("INTRO_CHIME_PATH", str(cfg("audio", "intro_chime", AUDIO_ASSET_DIR / "intro_chime.wav")))),
-        "transition_whoosh": Path(os.getenv("TRANSITION_WHOOSH_PATH", str(cfg("audio", "transition_whoosh", AUDIO_ASSET_DIR / "transition_whoosh.wav")))),
-        "music_bed": Path(os.getenv("MUSIC_BED_PATH", str(cfg("audio", "music_bed", AUDIO_ASSET_DIR / "music_bed.wav")))),
+        "intro_chime": Path(os.getenv("INTRO_CHIME_PATH", str(rebase_pipeline_path(cfg("audio", "intro_chime", AUDIO_ASSET_DIR / "intro_chime.wav"), AUDIO_ASSET_DIR / "intro_chime.wav")))),
+        "transition_whoosh": Path(os.getenv("TRANSITION_WHOOSH_PATH", str(rebase_pipeline_path(cfg("audio", "transition_whoosh", AUDIO_ASSET_DIR / "transition_whoosh.wav"), AUDIO_ASSET_DIR / "transition_whoosh.wav")))),
+        "rapid_cut_whoosh": Path(os.getenv("RAPID_CUT_WHOOSH_PATH", str(rebase_pipeline_path(cfg("audio", "rapid_cut_whoosh", AUDIO_ASSET_DIR / "rapid_cut_whoosh.wav"), AUDIO_ASSET_DIR / "rapid_cut_whoosh.wav")))),
+        "logo_whoosh": Path(os.getenv("LOGO_WHOOSH_PATH", str(rebase_pipeline_path(cfg("audio", "logo_whoosh", AUDIO_ASSET_DIR / "logo_whoosh.wav"), AUDIO_ASSET_DIR / "logo_whoosh.wav")))),
+        "logo_reveal_chime": Path(os.getenv("LOGO_REVEAL_CHIME_PATH", str(rebase_pipeline_path(cfg("audio", "logo_reveal_chime", AUDIO_ASSET_DIR / "logo_reveal_chime.wav"), AUDIO_ASSET_DIR / "logo_reveal_chime.wav")))),
+        "music_bed": Path(os.getenv("MUSIC_BED_PATH", str(rebase_pipeline_path(cfg("audio", "music_bed", AUDIO_ASSET_DIR / "music_bed.wav"), AUDIO_ASSET_DIR / "music_bed.wav")))),
     }
-    if all(path.exists() for path in configured.values()):
+    required = {"intro_chime", "transition_whoosh", "music_bed"}
+    if not all(configured[key].exists() for key in required):
+        manifest = generate_test_audio_assets(AUDIO_ASSET_DIR)
+        for key, path in configured.items():
+            if path.exists():
+                manifest[key] = str(path)
+        for optional, fallback in {
+            "rapid_cut_whoosh": "transition_whoosh",
+            "logo_whoosh": "transition_whoosh",
+            "logo_reveal_chime": "intro_chime",
+        }.items():
+            if optional not in manifest:
+                manifest[optional] = manifest.get(fallback, "")
+        manifest["missing_configured_assets"] = [
+            key for key, path in configured.items() if not path.exists()
+        ]
+    else:
         manifest = {
             "mode": "configured_assets",
             "asset_dir": str(AUDIO_ASSET_DIR),
-            **{key: str(path) for key, path in configured.items()},
+            **{key: str(path) for key, path in configured.items() if path.exists()},
             "note": "Using configured audio assets.",
         }
-    else:
-        manifest = generate_test_audio_assets(AUDIO_ASSET_DIR)
+        for optional, fallback in {
+            "rapid_cut_whoosh": "transition_whoosh",
+            "logo_whoosh": "transition_whoosh",
+            "logo_reveal_chime": "intro_chime",
+        }.items():
+            if optional not in manifest:
+                manifest[optional] = manifest.get(fallback, "")
     save_json(job_dir / "asset_manifest.json", manifest)
     write_status(audio_assets=manifest["mode"])
     return manifest
 
 
-def mix_audio_bed(input_path: Path, output_path: Path, assets: dict[str, Any], teaser_duration: float) -> None:
+def mix_audio_bed(input_path: Path, output_path: Path, assets: dict[str, Any], teaser_duration: float, sfx_events: list[dict[str, Any]] | None = None) -> None:
     chime = Path(assets.get("intro_chime", ""))
     whoosh = Path(assets.get("transition_whoosh", ""))
     music = Path(assets.get("music_bed", ""))
@@ -1503,47 +1753,68 @@ def mix_audio_bed(input_path: Path, output_path: Path, assets: dict[str, Any], t
     music_volume = cfg_float("audio", "music_volume", 0.055)
     ducking_threshold = cfg_float("audio", "ducking_threshold", 0.03)
     ducking_ratio = cfg_float("audio", "ducking_ratio", 8.0)
-    filter_complex = (
-        "[0:a]aformat=sample_rates=48000:channel_layouts=stereo,volume=1.0[voice];"
-        f"[3:a]atrim=0:{duration:.3f},aformat=sample_rates=48000:channel_layouts=stereo,volume={music_volume}[music];"
-        f"[music][voice]sidechaincompress=threshold={ducking_threshold}:ratio={ducking_ratio}:attack=20:release=350[ducked];"
-        f"[1:a]aformat=sample_rates=48000:channel_layouts=stereo,adelay=0|0,volume={chime_volume}[chime];"
-        f"[2:a]aformat=sample_rates=48000:channel_layouts=stereo,adelay={whoosh_ms}|{whoosh_ms},volume={whoosh_volume}[whoosh];"
-        "[voice][ducked][chime][whoosh]amix=inputs=4:duration=first:dropout_transition=0,alimiter=limit=0.95[aout]"
+    events = sfx_events or [
+        {"asset": "intro_chime", "time": 0.0, "volume": chime_volume, "label": "intro_chime"},
+        {"asset": "transition_whoosh", "time": whoosh_ms / 1000.0, "volume": whoosh_volume, "duration": 0.7, "label": "transition_whoosh"},
+    ]
+
+    valid_events: list[dict[str, Any]] = []
+    for event in events:
+        asset_path = Path(assets.get(str(event.get("asset", "")), ""))
+        if asset_path.exists():
+            copy = dict(event)
+            copy["path"] = str(asset_path)
+            valid_events.append(copy)
+
+    cmd = ["ffmpeg", "-y", "-i", str(input_path)]
+    for event in valid_events:
+        cmd.extend(["-i", str(event["path"])])
+    music_index = len(valid_events) + 1
+    cmd.extend(["-stream_loop", "-1", "-i", str(music)])
+
+    filters = [
+        "[0:a]aformat=sample_rates=48000:channel_layouts=stereo,volume=1.0,asplit=2[voice_mix][voice_side]",
+        f"[{music_index}:a]atrim=0:{duration:.3f},aformat=sample_rates=48000:channel_layouts=stereo,volume={music_volume}[music]",
+        f"[music][voice_side]sidechaincompress=threshold={ducking_threshold}:ratio={ducking_ratio}:attack=20:release=350[ducked]",
+    ]
+    mix_labels = ["[voice_mix]", "[ducked]"]
+    for index, event in enumerate(valid_events, start=1):
+        delay_ms = max(0, int(float(event.get("time", 0.0)) * 1000))
+        volume = float(event.get("volume", whoosh_volume))
+        label = f"sfx{index}"
+        trim = float(event.get("duration", 0.0) or 0.0)
+        trim_filter = f"atrim=0:{trim:.3f},asetpts=PTS-STARTPTS," if trim > 0 else ""
+        filters.append(
+            f"[{index}:a]{trim_filter}aformat=sample_rates=48000:channel_layouts=stereo,"
+            f"adelay={delay_ms}|{delay_ms},volume={volume}[{label}]"
+        )
+        mix_labels.append(f"[{label}]")
+    filters.append(
+        "".join(mix_labels)
+        + f"amix=inputs={len(mix_labels)}:duration=first:dropout_transition=0,alimiter=limit=0.95[aout]"
     )
-    run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(input_path),
-            "-i",
-            str(chime),
-            "-i",
-            str(whoosh),
-            "-stream_loop",
-            "-1",
-            "-i",
-            str(music),
-            "-filter_complex",
-            filter_complex,
-            "-map",
-            "0:v",
-            "-map",
-            "[aout]",
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-shortest",
-            "-movflags",
-            "+faststart",
-            str(output_path),
-        ],
-        "audio-mix",
-    )
+    filter_complex = ";".join(filters)
+
+    cmd.extend([
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "0:v",
+        "-map",
+        "[aout]",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ])
+    save_json(input_path.parent / "sfx_events.json", valid_events)
+    run(cmd, "audio-mix")
     write_status(audio_mix="complete")
 
 
@@ -1789,7 +2060,7 @@ def main() -> int:
         })
         save_json(job_dir / "transcript_analysis.json", analysis)
 
-        teaser, teaser_words, teaser_duration, nuggets = build_intro_teaser(content_video, content_words, analysis, job_dir)
+        teaser, teaser_words, teaser_duration, nuggets, sfx_events = build_intro_teaser(content_video, content_words, analysis, job_dir)
         if teaser_words and teaser != content_video:
             concat_intro_and_main(teaser, content_video, assembled, job_dir)
             final_caption_words = teaser_words + shift_words(content_words, teaser_duration)
@@ -1799,7 +2070,7 @@ def main() -> int:
             final_caption_words = content_words
 
         assets = resolve_audio_assets(job_dir)
-        mix_audio_bed(assembled, mixed, assets, teaser_duration)
+        mix_audio_bed(assembled, mixed, assets, teaser_duration, sfx_events)
         captions = write_ass_captions(final_caption_words, job_dir)
         burn_captions_or_copy(mixed, final, captions)
         make_thumbnail(final, thumbnail)
