@@ -43,10 +43,14 @@
   },
   "llm": {
     "provider": "openrouter",
-    "model": "openai/gpt-5",
+    "model": "openai/gpt-4.1-mini",
+    "fallback_models": [
+      "google/gemini-2.5-flash",
+      "openai/gpt-5"
+    ],
     "max_cost_per_job_usd": 0.2,
-    "prompt_price_per_million": 1.25,
-    "completion_price_per_million": 10.0
+    "prompt_price_per_million": 0.4,
+    "completion_price_per_million": 1.6
   },
   "audio": {
     "asset_dir": "/app/work_dir/assets/agentzero_pipeline/audio",

@@ -721,16 +721,26 @@ def fallback_analysis(words: list[dict[str, Any]], duration: float, reason: str)
     }
 
 
-def estimate_openrouter_cost(prompt_chars: int, output_tokens: int = 900) -> dict[str, Any]:
+def estimate_openrouter_cost(prompt_chars: int, output_tokens: int = 900, model: str = "") -> dict[str, Any]:
     prompt_tokens = max(1, int(prompt_chars / 4))
-    prompt_price_per_million = env_float(
-        "OPENROUTER_PROMPT_PRICE_PER_MILLION",
-        cfg_float("llm", "prompt_price_per_million", 1.25),
-    )
-    completion_price_per_million = env_float(
-        "OPENROUTER_COMPLETION_PRICE_PER_MILLION",
-        cfg_float("llm", "completion_price_per_million", 10.0),
-    )
+    default_prompt_price = 1.25
+    default_completion_price = 10.0
+    if "gpt-4.1-mini" in model.lower():
+        default_prompt_price = 0.4
+        default_completion_price = 1.6
+    if os.getenv("OPENROUTER_PROMPT_PRICE_PER_MILLION"):
+        prompt_price_per_million = env_float("OPENROUTER_PROMPT_PRICE_PER_MILLION", default_prompt_price)
+    elif "gpt-4.1-mini" in model.lower():
+        prompt_price_per_million = default_prompt_price
+    else:
+        prompt_price_per_million = cfg_float("llm", "prompt_price_per_million", default_prompt_price)
+
+    if os.getenv("OPENROUTER_COMPLETION_PRICE_PER_MILLION"):
+        completion_price_per_million = env_float("OPENROUTER_COMPLETION_PRICE_PER_MILLION", default_completion_price)
+    elif "gpt-4.1-mini" in model.lower():
+        completion_price_per_million = default_completion_price
+    else:
+        completion_price_per_million = cfg_float("llm", "completion_price_per_million", default_completion_price)
     estimated = (prompt_tokens / 1_000_000 * prompt_price_per_million) + (
         output_tokens / 1_000_000 * completion_price_per_million
     )
@@ -741,6 +751,53 @@ def estimate_openrouter_cost(prompt_chars: int, output_tokens: int = 900) -> dic
         "prompt_price_per_million": prompt_price_per_million,
         "completion_price_per_million": completion_price_per_million,
     }
+
+
+LLM_ANALYSIS_SCHEMA = {
+    "name": "shortform_transcript_analysis",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "title": {
+                "type": "string",
+                "description": "Compelling YouTube Shorts title, under 70 characters when possible.",
+            },
+            "description": {
+                "type": "string",
+                "description": "Short YouTube description with one concise paragraph and optional hashtags.",
+            },
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Searchable YouTube tags.",
+            },
+            "hook": {
+                "type": "string",
+                "description": "One-line reason this short is interesting.",
+            },
+            "nuggets": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 3,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "start": {"type": "number"},
+                        "end": {"type": "number"},
+                        "text": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "score": {"type": "number"},
+                    },
+                    "required": ["start", "end", "text", "reason", "score"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["title", "description", "tags", "hook", "nuggets"],
+        "additionalProperties": False,
+    },
+}
 
 
 def parse_llm_json(content: Any) -> dict[str, Any]:
@@ -754,6 +811,85 @@ def parse_llm_json(content: Any) -> dict[str, Any]:
     if match:
         content = match.group(0)
     return json.loads(content)
+
+
+def list_from_config_or_env(env_name: str, section: str, key: str, default: list[str]) -> list[str]:
+    raw_env = os.getenv(env_name, "").strip()
+    raw_value: Any = raw_env or cfg(section, key, default)
+    values: list[str] = []
+    if isinstance(raw_value, list):
+        values = [str(item).strip() for item in raw_value]
+    elif isinstance(raw_value, str):
+        values = [item.strip() for item in raw_value.split(",")]
+    values = [value for value in values if value]
+    return values or default
+
+
+def openrouter_models() -> list[str]:
+    env_model = os.getenv("OPENROUTER_MODEL", "").strip()
+    config_model = str(cfg("llm", "model", "openai/gpt-4.1-mini")).strip()
+    config_fallbacks = cfg("llm", "fallback_models", [])
+    primary = env_model or config_model or "openai/gpt-4.1-mini"
+    if not env_model and primary == "openai/gpt-5" and not config_fallbacks:
+        primary = "openai/gpt-4.1-mini"
+    fallbacks = list_from_config_or_env(
+        "OPENROUTER_FALLBACK_MODELS",
+        "llm",
+        "fallback_models",
+        ["google/gemini-2.5-flash", "openai/gpt-5"],
+    )
+    ordered = [primary or "openai/gpt-4.1-mini", *fallbacks]
+    deduped: list[str] = []
+    for model in ordered:
+        if model and model not in deduped:
+            deduped.append(model)
+    return deduped
+
+
+def extract_message_content(data: dict[str, Any]) -> str:
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise ValueError("OpenRouter response had no choices")
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    if not isinstance(message, dict):
+        raise ValueError("OpenRouter response had no message")
+
+    content = message.get("content")
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                parts.append(str(part.get("text") or part.get("content") or ""))
+            else:
+                parts.append(str(part))
+        content = "\n".join(part for part in parts if part.strip())
+
+    candidates = [
+        content,
+        message.get("reasoning_content"),
+        message.get("reasoning"),
+        data.get("output_text"),
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate
+    raise ValueError("OpenRouter response content was empty")
+
+
+def normalize_analysis(parsed: dict[str, Any], words: list[dict[str, Any]], duration: float, transcript_text: str) -> dict[str, Any]:
+    fallback = fallback_analysis(words, duration, "missing field")
+    parsed["source"] = "openrouter"
+    parsed["title"] = str(parsed.get("title") or fallback["title"]).strip()[:100]
+    parsed["description"] = str(parsed.get("description") or fallback["description"]).strip()[:4500]
+    tags = parsed.get("tags")
+    if not isinstance(tags, list):
+        tags = keyword_tags(transcript_text)
+    parsed["tags"] = [str(tag).strip()[:40] for tag in tags if str(tag).strip()][:12]
+    parsed["hook"] = str(parsed.get("hook") or parsed["title"]).strip()[:180]
+    parsed["nuggets"] = normalize_nuggets(parsed.get("nuggets"), words, duration)
+    if len(parsed["nuggets"]) < 2:
+        raise ValueError("OpenRouter returned too few usable nuggets")
+    return parsed
 
 
 def normalize_nuggets(raw_nuggets: Any, words: list[dict[str, Any]], duration: float) -> list[dict[str, Any]]:
@@ -830,18 +966,29 @@ def analyze_transcript(words: list[dict[str, Any]], duration: float, job_dir: Pa
         for word in words[:1800]
         if str(word.get("word", "")).strip()
     ]
+    deterministic_candidates = candidate_nuggets(words, duration, limit=12)
     prompt = (
-        "You are a senior YouTube Shorts editor. Analyze this transcript and return only valid JSON. "
-        "Choose 2-3 fast, high-value teaser nuggets for a GaryVee-style cold open. "
-        "Use word-safe timestamps from the supplied transcript. Also write a compelling YouTube Shorts title, "
-        "description, and tags. JSON schema: "
+        "You are a senior short-form editor cutting talking-head business content for YouTube Shorts.\n"
+        "Return only valid JSON matching the schema. No markdown, no explanations outside JSON.\n\n"
+        "Task:\n"
+        "- Pick 2-3 high-value teaser nuggets for a fast GaryVee-style cold open.\n"
+        "- Total teaser target: 5-8 seconds.\n"
+        "- The teaser is duplicated before the full edited content, so do not summarize; choose actual spoken moments.\n"
+        "- Prefer concrete, curiosity-building claims, pain points, contrarian lines, numbers, or strong promises.\n"
+        "- Avoid filler, greetings, setup-only phrases, and clips that feel mid-sentence.\n"
+        "- Use word-safe start/end timestamps from the word list. Start at the first useful word and end after a complete clause.\n"
+        "- Return nuggets sorted by editorial strength, highest score first.\n"
+        "- Write a compelling title under 70 characters when possible, a concise description, tags, and a one-line hook.\n\n"
+        "JSON shape:\n"
         "{\"title\": string, \"description\": string, \"tags\": string[], "
         "\"hook\": string, \"nuggets\": [{\"start\": number, \"end\": number, \"text\": string, "
         "\"reason\": string, \"score\": number}]}\n\n"
+        f"Deterministic candidate nugget windows, use or refine these when they are strong:\n{json.dumps(deterministic_candidates, ensure_ascii=True)}\n\n"
         f"Transcript text:\n{transcript_text[:12000]}\n\n"
         f"Word timestamps JSON:\n{json.dumps(compact_words, ensure_ascii=True)}"
     )
-    estimate = estimate_openrouter_cost(len(prompt))
+    models = openrouter_models()
+    estimate = estimate_openrouter_cost(len(prompt), model=models[0])
     max_cost = env_float("LLM_MAX_COST_PER_JOB_USD", cfg_float("llm", "max_cost_per_job_usd", 0.20))
     if estimate["estimated_cost_usd"] > max_cost:
         analysis = fallback_analysis(words, duration, "Estimated LLM cost above cap")
@@ -854,69 +1001,118 @@ def analyze_transcript(words: list[dict[str, Any]], duration: float, job_dir: Pa
         })
         return analysis
 
-    model = os.getenv("OPENROUTER_MODEL", str(cfg("llm", "model", "openai/gpt-5"))).strip() or "openai/gpt-5"
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": "Return strict JSON only. No markdown."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.4,
-        "max_tokens": 900,
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://agent-zero-upload.2.24.108.202.sslip.io",
+        "X-Title": "AgentZero ShortForm Renderer",
     }
-    request = urllib.request.Request(
-        "https://openrouter.ai/api/v1/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://agent-zero-upload.2.24.108.202.sslip.io",
-            "X-Title": "AgentZero ShortForm Renderer",
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You output parseable JSON only. Select short-form teaser clips with exact word-safe timestamps. "
+                "Never return an empty message."
+            ),
         },
-        method="POST",
-    )
+        {"role": "user", "content": prompt},
+    ]
 
-    write_status(step="llm-analysis", llm_model=model)
-    try:
-        with urllib.request.urlopen(request, timeout=90) as response:
-            data = json.loads(response.read().decode("utf-8"))
-        content = data["choices"][0]["message"]["content"]
-        parsed = parse_llm_json(content)
-        parsed["source"] = "openrouter"
-        parsed["title"] = str(parsed.get("title") or fallback_analysis(words, duration, "missing title")["title"])[:100]
-        parsed["description"] = str(parsed.get("description") or "").strip()[:4500]
-        if not parsed["description"]:
-            parsed["description"] = fallback_analysis(words, duration, "missing description")["description"]
-        tags = parsed.get("tags")
-        if not isinstance(tags, list):
-            tags = keyword_tags(transcript_text)
-        parsed["tags"] = [str(tag).strip()[:40] for tag in tags if str(tag).strip()][:12]
-        parsed["nuggets"] = normalize_nuggets(parsed.get("nuggets"), words, duration)
+    def make_payload(model_name: str, mode: str) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": model_name,
+            "messages": messages,
+            "temperature": 0.2,
+            "max_tokens": 900,
+            "stream": False,
+        }
+        if mode == "json_schema":
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": LLM_ANALYSIS_SCHEMA,
+            }
+            payload["provider"] = {"require_parameters": True}
+            payload["plugins"] = [{"id": "response-healing"}]
+        elif mode == "json_object":
+            payload["response_format"] = {"type": "json_object"}
+            payload["plugins"] = [{"id": "response-healing"}]
+        return payload
 
-        usage = data.get("usage", {}) if isinstance(data, dict) else {}
-        actual_cost = usage.get("cost") or usage.get("total_cost") or data.get("cost")
-        save_json(usage_path, {
-            "provider": "openrouter",
-            "model": model,
-            "used_llm": True,
-            "estimate": estimate,
-            "max_cost_usd": max_cost,
-            "usage": usage,
-            "actual_cost_usd": actual_cost,
-        })
-        write_status(llm_status="complete", llm_model=model, llm_estimated_cost_usd=estimate["estimated_cost_usd"], llm_actual_cost_usd=actual_cost)
-        return parsed
-    except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError) as exc:
-        analysis = fallback_analysis(words, duration, f"OpenRouter failed: {exc}")
-        save_json(usage_path, {
-            "provider": "openrouter",
-            "model": model,
-            "used_llm": False,
-            "reason": analysis["reason"],
-            "estimate": estimate,
-        })
-        write_status(llm_status="fallback", llm_error=str(exc)[:400])
-        return analysis
+    def post_openrouter(payload: dict[str, Any]) -> dict[str, Any]:
+        request = urllib.request.Request(
+            "https://openrouter.ai/api/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=90) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = str(exc)
+            raise RuntimeError(f"OpenRouter HTTP {exc.code}: {body[:700]}") from exc
+
+    attempts: list[dict[str, Any]] = []
+    modes = ["json_schema", "json_object", "plain_json"]
+    write_status(step="llm-analysis", llm_model=models[0], llm_status="running", llm_attempts=0)
+
+    for model in models:
+        for mode in modes:
+            attempt = {"model": model, "mode": mode, "ok": False}
+            attempts.append(attempt)
+            write_status(step="llm-analysis", llm_model=model, llm_mode=mode, llm_attempts=len(attempts))
+            try:
+                data = post_openrouter(make_payload(model, mode))
+                content = extract_message_content(data)
+                parsed = parse_llm_json(content)
+                analysis = normalize_analysis(parsed, words, duration, transcript_text)
+                usage = data.get("usage", {}) if isinstance(data, dict) else {}
+                actual_cost = usage.get("cost") or usage.get("total_cost") or data.get("cost")
+                attempt["ok"] = True
+                attempt["usage"] = usage
+                save_json(usage_path, {
+                    "provider": "openrouter",
+                    "model": model,
+                    "mode": mode,
+                    "models_attempted": models,
+                    "attempts": attempts,
+                    "used_llm": True,
+                    "estimate": estimate,
+                    "max_cost_usd": max_cost,
+                    "usage": usage,
+                    "actual_cost_usd": actual_cost,
+                })
+                write_status(
+                    llm_status="complete",
+                    llm_model=model,
+                    llm_mode=mode,
+                    llm_attempts=len(attempts),
+                    llm_estimated_cost_usd=estimate["estimated_cost_usd"],
+                    llm_actual_cost_usd=actual_cost,
+                    llm_error="",
+                )
+                return analysis
+            except (RuntimeError, urllib.error.URLError, KeyError, ValueError, json.JSONDecodeError) as exc:
+                attempt["error"] = str(exc)[:700]
+                continue
+
+    reason = attempts[-1].get("error", "OpenRouter produced no usable analysis") if attempts else "OpenRouter produced no usable analysis"
+    analysis = fallback_analysis(words, duration, f"OpenRouter failed after {len(attempts)} attempts: {reason}")
+    save_json(usage_path, {
+        "provider": "openrouter",
+        "models_attempted": models,
+        "attempts": attempts,
+        "used_llm": False,
+        "reason": analysis["reason"],
+        "estimate": estimate,
+        "max_cost_usd": max_cost,
+    })
+    write_status(llm_status="fallback", llm_attempts=len(attempts), llm_error=analysis["reason"][:400])
+    return analysis
 
 
 def build_intro_teaser(content_video: Path, words: list[dict[str, Any]], analysis: dict[str, Any], job_dir: Path) -> tuple[Path, list[dict[str, Any]], float, list[dict[str, Any]]]:
