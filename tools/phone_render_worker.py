@@ -1751,7 +1751,7 @@ def build_logo_interrupt_intro(
     words: list[dict[str, Any]],
     job_dir: Path,
 ) -> tuple[Path, list[dict[str, Any]], float, list[dict[str, Any]], dict[str, Any]] | None:
-    if not cfg_bool("logo_interrupt_intro", "enabled", True):
+    if env_bool("AGENTZERO_DISABLE_LOGO_INTERRUPT", False):
         return None
 
     duration = ffprobe_duration(content_video)
