@@ -1746,6 +1746,139 @@ def configured_phrase_list(section: str, key: str, default: list[str]) -> list[s
     return default
 
 
+def first_listicle_enumerator(words: list[dict[str, Any]]) -> tuple[int, dict[str, Any]] | None:
+    clean_words = timed_words(words)
+    tokens = [normalized_word_token(str(word.get("word", ""))) for word in clean_words]
+    enumerators = {"first", "second", "third", "fourth", "firstly", "secondly", "thirdly", "fourthly"}
+    promise_terms = {"factor", "factors", "step", "steps", "reason", "reasons", "way", "ways", "check", "checks"}
+
+    for index, token in enumerate(tokens):
+        if token not in enumerators:
+            continue
+        start = float(clean_words[index]["start"])
+        if start < 1.0 or start > 9.0:
+            continue
+        earlier_tokens = set(tokens[:index])
+        if not earlier_tokens.intersection(promise_terms):
+            continue
+        return index, clean_words[index]
+    return None
+
+
+def build_listicle_logo_intro(
+    content_video: Path,
+    words: list[dict[str, Any]],
+    job_dir: Path,
+) -> tuple[Path, list[dict[str, Any]], float, list[dict[str, Any]], dict[str, Any]] | None:
+    if env_bool("AGENTZERO_DISABLE_LISTICLE_LOGO_INTRO", False):
+        return None
+
+    clean_words = timed_words(words)
+    found = first_listicle_enumerator(words)
+    if not clean_words or not found:
+        save_json(job_dir / "listicle_logo_intro.json", {
+            "mode": "listicle_logo_intro",
+            "state": "skipped",
+            "reason": "no early listicle enumerator found",
+        })
+        return None
+
+    enumerator_index, enumerator_word = found
+    if enumerator_index <= 0:
+        return None
+
+    duration = ffprobe_duration(content_video)
+    hook_start = 0.0
+    hook_end = float(clean_words[enumerator_index - 1]["end"]) + cfg_float("listicle_intro", "hook_post_padding_seconds", 0.035)
+    resume_start = max(0.0, float(enumerator_word["start"]) - cfg_float("listicle_intro", "resume_pre_padding_seconds", 0.0))
+    hook_end = min(hook_end, max(0.0, resume_start - 0.001))
+
+    min_hook_seconds = cfg_float("listicle_intro", "min_hook_seconds", 1.6)
+    max_hook_seconds = cfg_float("listicle_intro", "max_hook_seconds", 7.5)
+    if hook_end - hook_start < min_hook_seconds or hook_end - hook_start > max_hook_seconds:
+        save_json(job_dir / "listicle_logo_intro.json", {
+            "mode": "listicle_logo_intro",
+            "state": "skipped",
+            "reason": "hook duration outside range",
+            "hook_start": hook_start,
+            "hook_end": hook_end,
+            "resume_start": resume_start,
+        })
+        return None
+    if resume_start >= duration:
+        return None
+
+    hook_video = job_dir / "listicle_hook.mp4"
+    render_segments(content_video, hook_video, [(hook_start, hook_end)], "listicle-hook")
+    hook_duration = ffprobe_duration(hook_video)
+    hook_words = words_for_segments(words, [(hook_start, hook_end)])
+
+    logo_reveal, logo_duration = create_logo_reveal(job_dir)
+    if not logo_reveal:
+        save_json(job_dir / "listicle_logo_intro.json", {
+            "mode": "listicle_logo_intro",
+            "state": "skipped",
+            "reason": "logo reveal missing",
+        })
+        return None
+
+    main_tail = job_dir / "listicle_main_tail.mp4"
+    render_segments(content_video, main_tail, [(resume_start, duration)], "listicle-main-tail")
+    tail_words = words_for_segments(words, [(resume_start, duration)])
+
+    assembled = job_dir / "assembled_listicle_logo_intro.mp4"
+    concat_videos([hook_video, logo_reveal, main_tail], assembled, job_dir, "concat-listicle-logo-intro")
+
+    content_resume_offset = hook_duration + logo_duration
+    final_words = hook_words + shift_words(tail_words, content_resume_offset)
+    logo_whoosh_volume = cfg_float("audio", "logo_whoosh_volume", 0.22) * 2.0
+    logo_chime_volume = cfg_float("audio", "logo_reveal_chime_volume", 1.12) * 2.0
+    sfx_events = [
+        {
+            "asset": "logo_whoosh",
+            "time": max(0.0, hook_duration - cfg_float("logo", "swoosh_pre_roll", 0.05)),
+            "volume": logo_whoosh_volume,
+            "duration": cfg_float("audio", "logo_whoosh_duration", 1.05),
+            "label": "logo_fly_in_loud",
+        },
+        {
+            "asset": "logo_reveal_chime",
+            "time": hook_duration + cfg_float("logo", "chime_offset", 0.36),
+            "volume": logo_chime_volume,
+            "duration": cfg_float("audio", "logo_reveal_chime_duration", 1.0),
+            "label": "logo_reveal_loud",
+        },
+    ]
+    manifest = {
+        "mode": "listicle_logo_intro",
+        "state": "created",
+        "hook": {
+            "start": hook_start,
+            "end": round(hook_end, 3),
+            "text": plain_text_from_words(hook_words),
+        },
+        "enumerator": {
+            "word": str(enumerator_word.get("word", "")).strip(),
+            "start": round(float(enumerator_word["start"]), 3),
+        },
+        "resume_start": round(resume_start, 3),
+        "hook_duration": hook_duration,
+        "logo_duration": logo_duration,
+        "content_resume_offset": content_resume_offset,
+        "sfx_events": sfx_events,
+        "note": "Listicle hook is used once, logo reveal interrupts, then main content resumes at the first enumerated point.",
+    }
+    save_json(job_dir / "listicle_logo_intro.json", manifest)
+    write_status(
+        intro_teaser=str(hook_video),
+        intro_duration=round(content_resume_offset, 2),
+        intro_nuggets=1,
+        intro_mode="listicle_logo_intro",
+        resume_start=round(resume_start, 3),
+    )
+    return assembled, final_words, content_resume_offset, sfx_events, manifest
+
+
 def build_logo_interrupt_intro(
     content_video: Path,
     words: list[dict[str, Any]],
@@ -1813,20 +1946,22 @@ def build_logo_interrupt_intro(
 
     content_resume_offset = opening_duration + logo_duration
     final_words = opening_words + shift_words(tail_words, content_resume_offset)
+    logo_whoosh_volume = cfg_float("audio", "logo_whoosh_volume", 0.22) * 2.0
+    logo_chime_volume = cfg_float("audio", "logo_reveal_chime_volume", 1.12) * 2.0
     sfx_events = [
         {
             "asset": "logo_whoosh",
             "time": max(0.0, opening_duration - cfg_float("logo", "swoosh_pre_roll", 0.05)),
-            "volume": cfg_float("audio", "logo_whoosh_volume", 0.22),
+            "volume": logo_whoosh_volume,
             "duration": cfg_float("audio", "logo_whoosh_duration", 1.05),
-            "label": "logo_fly_in",
+            "label": "logo_fly_in_loud",
         },
         {
             "asset": "logo_reveal_chime",
             "time": opening_duration + cfg_float("logo", "chime_offset", 0.36),
-            "volume": cfg_float("audio", "logo_reveal_chime_volume", 1.12),
+            "volume": logo_chime_volume,
             "duration": cfg_float("audio", "logo_reveal_chime_duration", 1.0),
-            "label": "logo_reveal",
+            "label": "logo_reveal_loud",
         },
     ]
     manifest = {
@@ -1885,9 +2020,9 @@ def build_intro_teaser(content_video: Path, words: list[dict[str, Any]], analysi
                 sfx_events.append({
                     "asset": "rapid_cut_whoosh",
                     "time": max(0.0, running + cfg_float("rapid_intro", "whoosh_after_cut_delay_seconds", 0.0)),
-                    "volume": cfg_float("audio", "rapid_cut_whoosh_volume", 0.18),
+                    "volume": cfg_float("audio", "rapid_cut_whoosh_volume", 0.18) * 2.0,
                     "duration": cfg_float("audio", "rapid_cut_whoosh_duration", 0.42),
-                    "label": "rapid_cut",
+                    "label": "rapid_cut_loud",
                 })
                 running += hold_after_clips[index]
 
@@ -1897,16 +2032,16 @@ def build_intro_teaser(content_video: Path, words: list[dict[str, Any]], analysi
                 sfx_events.append({
                     "asset": "logo_whoosh",
                     "time": max(0.0, rapid_duration - cfg_float("logo", "swoosh_pre_roll", 0.05)),
-                    "volume": cfg_float("audio", "logo_whoosh_volume", 0.22),
+                    "volume": cfg_float("audio", "logo_whoosh_volume", 0.22) * 2.0,
                     "duration": cfg_float("audio", "logo_whoosh_duration", 1.05),
-                    "label": "logo_fly_in",
+                    "label": "logo_fly_in_loud",
                 })
                 sfx_events.append({
                     "asset": "logo_reveal_chime",
                     "time": rapid_duration + cfg_float("logo", "chime_offset", 0.36),
-                    "volume": cfg_float("audio", "logo_reveal_chime_volume", 0.30),
+                    "volume": cfg_float("audio", "logo_reveal_chime_volume", 0.30) * 2.0,
                     "duration": cfg_float("audio", "logo_reveal_chime_duration", 1.0),
-                    "label": "logo_reveal",
+                    "label": "logo_reveal_loud",
                 })
                 intro_parts.append(logo_reveal)
 
@@ -2105,8 +2240,8 @@ def mix_audio_bed(input_path: Path, output_path: Path, assets: dict[str, Any], t
     ducking_threshold = cfg_float("audio", "ducking_threshold", 0.03)
     ducking_ratio = cfg_float("audio", "ducking_ratio", 8.0)
     events = sfx_events or [
-        {"asset": "intro_chime", "time": 0.0, "volume": chime_volume, "label": "intro_chime"},
-        {"asset": "transition_whoosh", "time": whoosh_ms / 1000.0, "volume": whoosh_volume, "duration": 0.7, "label": "transition_whoosh"},
+        {"asset": "intro_chime", "time": 0.0, "volume": chime_volume * 2.0, "label": "intro_chime_loud"},
+        {"asset": "transition_whoosh", "time": whoosh_ms / 1000.0, "volume": whoosh_volume * 2.0, "duration": 0.7, "label": "transition_whoosh_loud"},
     ]
 
     valid_events: list[dict[str, Any]] = []
@@ -2418,14 +2553,20 @@ def main() -> int:
             shutil.copy2(interrupt_video, assembled)
             nuggets = interrupt_manifest.get("opening_nuggets", [])
         else:
-            teaser, teaser_words, teaser_duration, nuggets, sfx_events = build_intro_teaser(content_video, content_words, analysis, job_dir)
-            if teaser_words and teaser != content_video:
-                concat_intro_and_main(teaser, content_video, assembled, job_dir)
-                final_caption_words = teaser_words + shift_words(content_words, teaser_duration)
+            listicle_intro = build_listicle_logo_intro(content_video, content_words, job_dir)
+            if listicle_intro:
+                listicle_video, final_caption_words, teaser_duration, sfx_events, listicle_manifest = listicle_intro
+                shutil.copy2(listicle_video, assembled)
+                nuggets = [listicle_manifest.get("hook", {})]
             else:
-                shutil.copy2(content_video, assembled)
-                teaser_duration = 0.0
-                final_caption_words = content_words
+                teaser, teaser_words, teaser_duration, nuggets, sfx_events = build_intro_teaser(content_video, content_words, analysis, job_dir)
+                if teaser_words and teaser != content_video:
+                    concat_intro_and_main(teaser, content_video, assembled, job_dir)
+                    final_caption_words = teaser_words + shift_words(content_words, teaser_duration)
+                else:
+                    shutil.copy2(content_video, assembled)
+                    teaser_duration = 0.0
+                    final_caption_words = content_words
 
         assets = resolve_audio_assets(job_dir)
         mix_audio_bed(assembled, mixed, assets, teaser_duration, sfx_events)
