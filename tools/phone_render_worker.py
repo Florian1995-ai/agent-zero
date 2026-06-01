@@ -2107,16 +2107,52 @@ def build_intro_teaser(content_video: Path, words: list[dict[str, Any]], analysi
 
     teaser = job_dir / "intro_teaser.mp4"
     render_segments(content_video, teaser, segments, "intro-teaser")
-    teaser_duration = ffprobe_duration(teaser)
+    teaser_clip_duration = ffprobe_duration(teaser)
     teaser_words = words_for_segments(words, segments)
+    sfx_events: list[dict[str, Any]] = []
+    running = 0.0
+    for index, (start, end) in enumerate(segments[:-1]):
+        running += max(0.0, end - start)
+        sfx_events.append({
+            "asset": "rapid_cut_whoosh",
+            "time": round(running, 3),
+            "volume": cfg_float("audio", "rapid_cut_whoosh_volume", 0.42) * 2.0,
+            "duration": cfg_float("audio", "rapid_cut_whoosh_duration", 0.42),
+            "label": f"teaser_cut_{index + 1}",
+        })
+
+    logo_reveal, logo_duration = create_logo_reveal(job_dir)
+    if logo_reveal:
+        teaser_with_logo = job_dir / "intro_teaser_with_logo.mp4"
+        concat_videos([teaser, logo_reveal], teaser_with_logo, job_dir, "concat-teaser-logo")
+        sfx_events.append({
+            "asset": "logo_whoosh",
+            "time": max(0.0, teaser_clip_duration - cfg_float("logo", "swoosh_pre_roll", 0.05)),
+            "volume": cfg_float("audio", "logo_whoosh_volume", 0.22) * 2.0,
+            "duration": cfg_float("audio", "logo_whoosh_duration", 1.05),
+            "label": "logo_fly_in_loud",
+        })
+        sfx_events.append({
+            "asset": "logo_reveal_chime",
+            "time": teaser_clip_duration + cfg_float("logo", "chime_offset", 0.36),
+            "volume": cfg_float("audio", "logo_reveal_chime_volume", 1.12) * 2.0,
+            "duration": cfg_float("audio", "logo_reveal_chime_duration", 1.0),
+            "label": "logo_reveal_loud",
+        })
+        teaser = teaser_with_logo
+
+    teaser_duration = ffprobe_duration(teaser)
     save_json(job_dir / "intro_nuggets.json", {
         "nuggets": nuggets[:max_nuggets],
         "segments": segments,
         "duration": teaser_duration,
+        "teaser_clip_duration": teaser_clip_duration,
+        "logo_duration": logo_duration,
+        "sfx_events": sfx_events,
         "source": analysis.get("source", "unknown"),
     })
     write_status(intro_teaser=str(teaser), intro_duration=round(teaser_duration, 2), intro_nuggets=len(segments))
-    return teaser, teaser_words, teaser_duration, nuggets[:max_nuggets], []
+    return teaser, teaser_words, teaser_duration, nuggets[:max_nuggets], sfx_events
 
 
 def concat_intro_and_main(teaser: Path, main_video: Path, output_path: Path, job_dir: Path) -> None:
