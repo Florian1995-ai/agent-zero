@@ -1467,11 +1467,17 @@ def timed_words(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def phrase_variants(phrase: str) -> list[str]:
     clean = phrase.strip().lower()
-    if clean in {"4 factors", "four factors"}:
+    if clean in {"4 factors", "four factors"} or "four factors" in clean or "4 factors" in clean:
         variants = [
+            "there are four factors when picking a market",
+            "there are four factors when picking your market",
             "there are four factors to consider when picking a market",
+            "there are four factors to consider when picking your market",
+            "there are four factors when picking",
             "there are four factors to consider",
             "there are four factors",
+            "four factors when picking a market",
+            "four factors when picking your market",
             "four factors to consider",
             "four factors",
             "4 factors",
