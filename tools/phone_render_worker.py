@@ -1406,6 +1406,15 @@ def normalized_word_token(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.lower())
 
 
+def timed_words(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        word for word in words
+        if word.get("start") is not None
+        and word.get("end") is not None
+        and normalized_word_token(str(word.get("word", "")))
+    ]
+
+
 def phrase_variants(phrase: str) -> list[str]:
     clean = phrase.strip().lower()
     if clean in {"4 factors", "four factors"}:
@@ -1443,13 +1452,42 @@ def phrase_variants(phrase: str) -> list[str]:
     return deduped
 
 
+def find_phrase_window(
+    words: list[dict[str, Any]],
+    phrase: str,
+    duration: float,
+    pre_padding: float = 0.0,
+    post_padding: float = 0.035,
+) -> dict[str, Any] | None:
+    clean_words = timed_words(words)
+    tokens = [normalized_word_token(str(word.get("word", ""))) for word in clean_words]
+    for variant in phrase_variants(phrase):
+        phrase_tokens = [normalized_word_token(part) for part in variant.split() if normalized_word_token(part)]
+        if not phrase_tokens:
+            continue
+        for index in range(0, max(0, len(tokens) - len(phrase_tokens) + 1)):
+            if tokens[index:index + len(phrase_tokens)] != phrase_tokens:
+                continue
+            phrase_end_index = index + len(phrase_tokens) - 1
+            start = max(0.0, float(clean_words[index]["start"]) - pre_padding)
+            end = min(duration, float(clean_words[phrase_end_index]["end"]) + post_padding)
+            if index > 0:
+                start = max(start, float(clean_words[index - 1]["end"]) + 0.001)
+            if phrase_end_index + 1 < len(clean_words):
+                end = min(end, float(clean_words[phrase_end_index + 1]["start"]) - 0.001)
+            segment_words = words_in_time_range(words, start, end)
+            return {
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "text": plain_text_from_words(segment_words),
+                "phrase": phrase,
+                "matched": variant,
+            }
+    return None
+
+
 def find_phrase_segment(words: list[dict[str, Any]], phrase: str, duration: float) -> dict[str, Any] | None:
-    clean_words = [
-        word for word in words
-        if word.get("start") is not None
-        and word.get("end") is not None
-        and normalized_word_token(str(word.get("word", "")))
-    ]
+    clean_words = timed_words(words)
     tokens = [normalized_word_token(str(word.get("word", ""))) for word in clean_words]
     padding = cfg_float("rapid_intro", "padding_seconds", 0.035)
     pre_padding = cfg_float("rapid_intro", "pre_padding_seconds", padding)
@@ -1568,6 +1606,10 @@ def concat_videos(paths: list[Path], output_path: Path, job_dir: Path, step: str
     )
 
 
+def logo_overlay_y_expression(fly_seconds: float) -> str:
+    return f"if(lt(t\\,{fly_seconds:.3f})\\,(H-h)/2+260*(1-t/{fly_seconds:.3f})\\,(H-h)/2)"
+
+
 def create_logo_reveal(job_dir: Path) -> tuple[Path | None, float]:
     if not cfg_bool("logo", "enabled", False):
         return None, 0.0
@@ -1586,11 +1628,13 @@ def create_logo_reveal(job_dir: Path) -> tuple[Path | None, float]:
     logo_width = cfg_int("logo", "width", 650)
     background = str(cfg("logo", "background", "0xf5f8fb"))
     fly_seconds = max(0.12, cfg_float("logo", "fly_seconds", 0.42))
-    overlay_x = f"if(gte(t\\,{fly_seconds:.3f})\\,(W-w)/2\\,-w+((W-w)/2+w)*t/{fly_seconds:.3f})"
+    overlay_y = logo_overlay_y_expression(fly_seconds)
     filter_complex = (
         f"[1:v]format=rgba,scale={logo_width}:-1,"
-        "fade=t=in:st=0.04:d=0.16:alpha=1[logo];"
-        f"[0:v][logo]overlay=x='{overlay_x}':y='(H-h)/2':format=auto[v];"
+        "fade=t=in:st=0.04:d=0.16:alpha=1,split=2[logo][shadow_src];"
+        "[shadow_src]colorchannelmixer=rr=0:gg=0:bb=0:aa=0.24,boxblur=24:1[shadow];"
+        f"[0:v][shadow]overlay=x='(W-w)/2':y='{overlay_y}+26':format=auto[with_shadow];"
+        f"[with_shadow][logo]overlay=x='(W-w)/2':y='{overlay_y}':format=auto[v];"
         f"anullsrc=r=48000:cl=stereo,atrim=0:{reveal_duration:.3f}[a]"
     )
     run(
@@ -1635,6 +1679,124 @@ def create_logo_reveal(job_dir: Path) -> tuple[Path | None, float]:
     duration = ffprobe_duration(reveal)
     write_status(logo_reveal=str(reveal), logo_reveal_duration=round(duration, 2))
     return reveal, duration
+
+
+def configured_phrase_list(section: str, key: str, default: list[str]) -> list[str]:
+    value = cfg(section, key, default)
+    if isinstance(value, str):
+        return [item.strip() for item in value.split("|") if item.strip()]
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return default
+
+
+def build_logo_interrupt_intro(
+    content_video: Path,
+    words: list[dict[str, Any]],
+    job_dir: Path,
+) -> tuple[Path, list[dict[str, Any]], float, list[dict[str, Any]], dict[str, Any]] | None:
+    if not cfg_bool("logo_interrupt_intro", "enabled", False):
+        return None
+
+    duration = ffprobe_duration(content_video)
+    pre_padding = cfg_float("logo_interrupt_intro", "pre_padding_seconds", 0.0)
+    post_padding = cfg_float("logo_interrupt_intro", "post_padding_seconds", 0.035)
+    opening_phrases = configured_phrase_list(
+        "logo_interrupt_intro",
+        "opening_phrases",
+        [
+            "there are four factors to consider when picking a market",
+            "the first one is",
+        ],
+    )
+    resume_phrase = str(cfg("logo_interrupt_intro", "resume_phrase", "is the market in pain")).strip()
+    if not opening_phrases or not resume_phrase:
+        return None
+
+    opening_nuggets: list[dict[str, Any]] = []
+    opening_segments: list[tuple[float, float]] = []
+    for phrase in opening_phrases:
+        found = find_phrase_window(words, phrase, duration, pre_padding=pre_padding, post_padding=post_padding)
+        if not found:
+            save_json(job_dir / "logo_interrupt_intro.json", {
+                "mode": "logo_interrupt_intro",
+                "state": "skipped",
+                "reason": f"opening phrase not found: {phrase}",
+            })
+            return None
+        opening_nuggets.append(found)
+        opening_segments.append((float(found["start"]), float(found["end"])))
+
+    resume = find_phrase_window(words, resume_phrase, duration, pre_padding=0.0, post_padding=0.0)
+    if not resume:
+        save_json(job_dir / "logo_interrupt_intro.json", {
+            "mode": "logo_interrupt_intro",
+            "state": "skipped",
+            "reason": f"resume phrase not found: {resume_phrase}",
+        })
+        return None
+    resume_start = float(resume["start"])
+    if resume_start >= duration:
+        return None
+
+    opening_video = job_dir / "logo_interrupt_opening.mp4"
+    render_segments(content_video, opening_video, opening_segments, "logo-interrupt-opening")
+    opening_duration = ffprobe_duration(opening_video)
+    opening_words = words_for_segments(words, opening_segments)
+
+    logo_reveal, logo_duration = create_logo_reveal(job_dir)
+    if not logo_reveal:
+        return None
+
+    main_tail = job_dir / "logo_interrupt_main_tail.mp4"
+    render_segments(content_video, main_tail, [(resume_start, duration)], "logo-interrupt-main-tail")
+    tail_words = words_for_segments(words, [(resume_start, duration)])
+
+    assembled = job_dir / "assembled_logo_interrupt.mp4"
+    concat_videos([opening_video, logo_reveal, main_tail], assembled, job_dir, "concat-logo-interrupt")
+
+    content_resume_offset = opening_duration + logo_duration
+    final_words = opening_words + shift_words(tail_words, content_resume_offset)
+    sfx_events = [
+        {
+            "asset": "logo_whoosh",
+            "time": max(0.0, opening_duration - cfg_float("logo", "swoosh_pre_roll", 0.05)),
+            "volume": cfg_float("audio", "logo_whoosh_volume", 0.22),
+            "duration": cfg_float("audio", "logo_whoosh_duration", 1.05),
+            "label": "logo_fly_in",
+        },
+        {
+            "asset": "logo_reveal_chime",
+            "time": opening_duration + cfg_float("logo", "chime_offset", 0.36),
+            "volume": cfg_float("audio", "logo_reveal_chime_volume", 1.12),
+            "duration": cfg_float("audio", "logo_reveal_chime_duration", 1.0),
+            "label": "logo_reveal",
+        },
+    ]
+    manifest = {
+        "mode": "logo_interrupt_intro",
+        "state": "created",
+        "opening_phrases": opening_phrases,
+        "opening_nuggets": opening_nuggets,
+        "opening_segments": opening_segments,
+        "opening_duration": opening_duration,
+        "logo_duration": logo_duration,
+        "resume_phrase": resume_phrase,
+        "resume": resume,
+        "resume_start": resume_start,
+        "content_resume_offset": content_resume_offset,
+        "sfx_events": sfx_events,
+        "note": "Opening line is used once, then logo reveal interrupts, then main content resumes from the next word.",
+    }
+    save_json(job_dir / "logo_interrupt_intro.json", manifest)
+    write_status(
+        intro_teaser=str(opening_video),
+        intro_duration=round(content_resume_offset, 2),
+        intro_nuggets=len(opening_segments),
+        intro_mode="logo_interrupt_intro",
+        resume_start=round(resume_start, 3),
+    )
+    return assembled, final_words, content_resume_offset, sfx_events, manifest
 
 
 def build_intro_teaser(content_video: Path, words: list[dict[str, Any]], analysis: dict[str, Any], job_dir: Path) -> tuple[Path, list[dict[str, Any]], float, list[dict[str, Any]], list[dict[str, Any]]]:
@@ -2193,14 +2355,20 @@ def main() -> int:
         })
         save_json(job_dir / "transcript_analysis.json", analysis)
 
-        teaser, teaser_words, teaser_duration, nuggets, sfx_events = build_intro_teaser(content_video, content_words, analysis, job_dir)
-        if teaser_words and teaser != content_video:
-            concat_intro_and_main(teaser, content_video, assembled, job_dir)
-            final_caption_words = teaser_words + shift_words(content_words, teaser_duration)
+        interrupt_intro = build_logo_interrupt_intro(content_video, content_words, job_dir)
+        if interrupt_intro:
+            interrupt_video, final_caption_words, teaser_duration, sfx_events, interrupt_manifest = interrupt_intro
+            shutil.copy2(interrupt_video, assembled)
+            nuggets = interrupt_manifest.get("opening_nuggets", [])
         else:
-            shutil.copy2(content_video, assembled)
-            teaser_duration = 0.0
-            final_caption_words = content_words
+            teaser, teaser_words, teaser_duration, nuggets, sfx_events = build_intro_teaser(content_video, content_words, analysis, job_dir)
+            if teaser_words and teaser != content_video:
+                concat_intro_and_main(teaser, content_video, assembled, job_dir)
+                final_caption_words = teaser_words + shift_words(content_words, teaser_duration)
+            else:
+                shutil.copy2(content_video, assembled)
+                teaser_duration = 0.0
+                final_caption_words = content_words
 
         assets = resolve_audio_assets(job_dir)
         mix_audio_bed(assembled, mixed, assets, teaser_duration, sfx_events)

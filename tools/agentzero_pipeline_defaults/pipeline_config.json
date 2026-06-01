@@ -41,8 +41,18 @@
     "target_seconds": 8.0,
     "max_seconds": 8.5
   },
-  "rapid_intro": {
+  "logo_interrupt_intro": {
     "enabled": true,
+    "opening_phrases": [
+      "there are four factors to consider when picking a market",
+      "the first one is"
+    ],
+    "resume_phrase": "is the market in pain",
+    "pre_padding_seconds": 0.0,
+    "post_padding_seconds": 0.035
+  },
+  "rapid_intro": {
+    "enabled": false,
     "phrases": [
       "four factors",
       "pain",
@@ -98,8 +108,8 @@
     "asset_dir": "/app/work_dir/assets/agentzero_pipeline/logo",
     "image_path": "/app/work_dir/assets/agentzero_pipeline/logo/florian-rolke-logo.png",
     "animation_path": "/app/work_dir/assets/agentzero_pipeline/logo/florian-rolke-logo.png",
-    "reveal_duration": 1.15,
-    "fly_seconds": 0.42,
+    "reveal_duration": 1.35,
+    "fly_seconds": 0.52,
     "width": 650,
     "background": "0xf5f8fb",
     "swoosh_pre_roll": 0.05,
