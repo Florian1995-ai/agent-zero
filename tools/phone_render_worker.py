@@ -1667,7 +1667,7 @@ def logo_overlay_y_expression(fly_seconds: float) -> str:
 
 
 def create_logo_reveal(job_dir: Path) -> tuple[Path | None, float]:
-    if not cfg_bool("logo", "enabled", False):
+    if env_bool("AGENTZERO_DISABLE_LOGO_REVEAL", False):
         return None, 0.0
     logo_path = Path(os.getenv("LOGO_ANIMATION_PATH", str(rebase_pipeline_path(cfg("logo", "animation_path", LOGO_ASSET_DIR / "florian-rolke-logo.png"), LOGO_ASSET_DIR / "florian-rolke-logo.png"))))
     if not logo_path.exists():
