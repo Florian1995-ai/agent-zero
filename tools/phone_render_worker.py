@@ -286,6 +286,56 @@ def newest_valid_upload() -> tuple[Path, dict[str, Any]]:
     raise RuntimeError(f"No stable ffprobe-valid uploads found in {UPLOAD_DIR}")
 
 
+def configured_upload() -> tuple[Path, dict[str, Any]] | None:
+    requested = os.getenv("AGENTZERO_INPUT_FILE", "").strip()
+    if not requested:
+        return None
+
+    root = UPLOAD_DIR.resolve()
+    raw_path = Path(requested)
+    candidate = raw_path.resolve() if raw_path.is_absolute() else (UPLOAD_DIR / raw_path.name).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        raise RuntimeError(f"Requested upload is outside upload directory: {requested}")
+
+    entry = {
+        "file": candidate.name,
+        "requested": requested,
+        "mode": "selected-upload",
+    }
+    if not candidate.is_file():
+        entry["ok"] = False
+        entry["reason"] = "file not found"
+        write_status(checked_uploads=[entry])
+        raise RuntimeError(f"Requested upload not found: {candidate.name}")
+    if candidate.suffix.lower() not in VIDEO_EXTENSIONS:
+        entry["ok"] = False
+        entry["reason"] = "unsupported extension"
+        write_status(checked_uploads=[entry])
+        raise RuntimeError(f"Requested upload has unsupported extension: {candidate.name}")
+
+    entry["size_mb"] = round(candidate.stat().st_size / (1024 * 1024), 1)
+    if not is_stable(candidate):
+        entry["ok"] = False
+        entry["reason"] = "not stable or too small"
+        write_status(checked_uploads=[entry])
+        raise RuntimeError(f"Requested upload is not stable yet: {candidate.name}")
+
+    probe = ffprobe_json(candidate)
+    duration = float(probe.get("format", {}).get("duration") or 0)
+    entry["duration"] = round(duration, 2)
+    if duration < 1 or not has_video_stream(probe):
+        entry["ok"] = False
+        entry["reason"] = "ffprobe invalid"
+        write_status(checked_uploads=[entry])
+        raise RuntimeError(f"Requested upload failed ffprobe validation: {candidate.name}")
+
+    entry["ok"] = True
+    write_status(checked_uploads=[entry], selected_upload=str(candidate))
+    return candidate, probe
+
+
 def make_job_dir(source: Path) -> Path:
     job_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{slugify(source.stem)}"
     job_dir = OUTPUT_ROOT / job_id
@@ -1695,7 +1745,7 @@ def build_logo_interrupt_intro(
     words: list[dict[str, Any]],
     job_dir: Path,
 ) -> tuple[Path, list[dict[str, Any]], float, list[dict[str, Any]], dict[str, Any]] | None:
-    if not cfg_bool("logo_interrupt_intro", "enabled", False):
+    if not cfg_bool("logo_interrupt_intro", "enabled", True):
         return None
 
     duration = ffprobe_duration(content_video)
@@ -2297,7 +2347,8 @@ def main() -> int:
         pipeline_config=str(PIPELINE_CONFIG_PATH),
     )
     try:
-        source, probe = newest_valid_upload()
+        selected = configured_upload()
+        source, probe = selected if selected else newest_valid_upload()
         job_dir = make_job_dir(source)
         log_path = job_dir / "render.log"
         write_status(state="running", input=str(source), job_dir=str(job_dir), log=str(log_path))

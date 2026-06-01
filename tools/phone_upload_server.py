@@ -19,7 +19,7 @@ import sys
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 
 UPLOAD_DIR = Path(os.getenv("AGENTZERO_UPLOAD_DIR", "/app/work_dir/assets/agentzero_uploads/shorts_test"))
@@ -50,6 +50,23 @@ def env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def resolve_upload_reference(filename: str) -> Path:
+    requested = Path(unquote(filename or "")).name
+    if not requested:
+        raise ValueError("Missing upload filename")
+    if Path(requested).suffix.lower() not in ALLOWED_EXTENSIONS:
+        raise ValueError("Unsupported upload extension")
+    target = (UPLOAD_DIR / requested).resolve()
+    root = UPLOAD_DIR.resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        raise ValueError("Invalid upload filename") from None
+    if not target.is_file():
+        raise FileNotFoundError(requested)
+    return target
+
+
 def list_uploads() -> str:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     rows = []
@@ -57,13 +74,15 @@ def list_uploads() -> str:
         if not path.is_file():
             continue
         size_mb = path.stat().st_size / (1024 * 1024)
+        quoted_name = html.escape(quote(path.name))
         rows.append(
             "<tr>"
             f"<td>{html.escape(path.name)}</td>"
             f"<td>{size_mb:.1f} MB</td>"
+            f"<td><button class='row-button render-upload-button' type='button' data-file='{quoted_name}'>Render</button></td>"
             "</tr>"
         )
-    return "".join(rows) or "<tr><td colspan='2'>No uploads yet.</td></tr>"
+    return "".join(rows) or "<tr><td colspan='3'>No uploads yet.</td></tr>"
 
 
 def read_render_status() -> dict:
@@ -178,6 +197,14 @@ def page(message: str = "") -> bytes:
     }}
     button:disabled {{
       opacity: 0.55;
+    }}
+    .row-button {{
+      width: auto;
+      margin: 0;
+      padding: 8px 12px;
+      font-size: 13px;
+      background: #f7f7f7;
+      color: #111;
     }}
     .progress-wrap {{
       display: none;
@@ -311,7 +338,7 @@ Max RSS MB: {render_rss}</div>
     </section>
     <h2>Recent Uploads</h2>
     <table>
-      <thead><tr><th>File</th><th>Size</th></tr></thead>
+      <thead><tr><th>File</th><th>Size</th><th>Action</th></tr></thead>
       <tbody>{list_uploads()}</tbody>
     </table>
   </main>
@@ -407,9 +434,11 @@ Max RSS MB: {render_rss}</div>
       const lines = [
         "State: " + (data.state || "idle"),
         "Step: " + (data.step || ""),
+        "Selected upload: " + (data.selected_upload || ""),
         "Input: " + (data.input || ""),
         "Final: " + (data.final || ""),
         "Thumbnail: " + (data.thumbnail || ""),
+        "Intro mode: " + (data.intro_mode || ""),
         "Duration: " + (data.duration || ""),
         "Intro: " + (data.intro_duration || ""),
         "Cuts: " + (data.cut_count || ""),
@@ -462,6 +491,27 @@ Max RSS MB: {render_rss}</div>
       }}
     }});
 
+    document.addEventListener("click", async (event) => {{
+      const target = event.target;
+      if (!target || !target.classList || !target.classList.contains("render-upload-button")) {{
+        return;
+      }}
+      const filename = decodeURIComponent(target.dataset.file || "");
+      target.disabled = true;
+      renderButton.disabled = true;
+      renderOutput.textContent = "Starting render for " + filename + "...";
+      try {{
+        const response = await fetch("/render-file?file=" + encodeURIComponent(filename), {{ method: "POST" }});
+        const data = await response.json();
+        renderOutput.textContent = renderStatusText(data);
+        updateRenderLinks(data);
+      }} catch (_err) {{
+        renderOutput.textContent = "Render start failed.";
+        target.disabled = false;
+        renderButton.disabled = false;
+      }}
+    }});
+
     window.setInterval(loadRenderStatus, 5000);
     loadRenderStatus();
   </script>
@@ -471,7 +521,7 @@ Max RSS MB: {render_rss}</div>
 
 
 class Handler(BaseHTTPRequestHandler):
-    def auto_start_render(self) -> None:
+    def auto_start_render(self, filename: str | None = None) -> None:
         if not env_bool("AUTO_RENDER_ON_UPLOAD", True):
             return
         global render_process
@@ -488,10 +538,13 @@ class Handler(BaseHTTPRequestHandler):
                 "output_root": str(OUTPUT_ROOT),
                 "log": str(log_path),
                 "trigger": "auto-upload",
+                "selected_upload": filename or "",
             }
         )
         script = Path(__file__).with_name("phone_render_worker.py")
         env = os.environ.copy()
+        if filename:
+            env["AGENTZERO_INPUT_FILE"] = filename
         log_file = log_path.open("ab", buffering=0)
         render_process = subprocess.Popen(
             [sys.executable, str(script)],
@@ -529,6 +582,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/render-latest":
             self.start_render()
             return
+        if path == "/render-file":
+            query = parse_qs(urlparse(self.path).query)
+            filename = query.get("file", [""])[0]
+            self.start_render(filename)
+            return
 
         content_type = self.headers.get("content-type", "")
         if not content_type.startswith("multipart/form-data"):
@@ -555,7 +613,7 @@ class Handler(BaseHTTPRequestHandler):
         with partial.open("wb") as out_file:
             shutil.copyfileobj(field.file, out_file, length=1024 * 1024)
         partial.rename(destination)
-        self.auto_start_render()
+        self.auto_start_render(filename)
 
         if self.headers.get("X-Requested-With") == "XMLHttpRequest":
             payload = json.dumps(
@@ -643,11 +701,22 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 remaining -= len(chunk)
 
-    def start_render(self) -> None:
+    def start_render(self, filename: str | None = None) -> None:
         global render_process
         if render_process and render_process.poll() is None:
             self.send_json(current_render_status() | {"ok": True, "message": "Render already running"}, 202)
             return
+
+        selected_upload = ""
+        if filename:
+            try:
+                selected_upload = resolve_upload_reference(filename).name
+            except FileNotFoundError:
+                self.send_json({"ok": False, "error": f"Upload not found: {Path(filename).name}"}, 404)
+                return
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 400)
+                return
 
         OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
         log_path = OUTPUT_ROOT / "render-launch.log"
@@ -658,11 +727,14 @@ class Handler(BaseHTTPRequestHandler):
                 "upload_dir": str(UPLOAD_DIR),
                 "output_root": str(OUTPUT_ROOT),
                 "log": str(log_path),
+                "selected_upload": selected_upload,
             }
         )
 
         script = Path(__file__).with_name("phone_render_worker.py")
         env = os.environ.copy()
+        if selected_upload:
+            env["AGENTZERO_INPUT_FILE"] = selected_upload
         log_file = log_path.open("ab", buffering=0)
         render_process = subprocess.Popen(
             [sys.executable, str(script)],
