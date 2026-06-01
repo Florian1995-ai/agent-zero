@@ -504,6 +504,36 @@ def render_segments(
     return max(0, len(segments) - 1)
 
 
+def segment_boundary_times(segments: list[tuple[float, float]], max_events: int = 10) -> list[float]:
+    times: list[float] = []
+    cursor = 0.0
+    for start, end in segments[:-1]:
+        cursor += max(0.0, end - start)
+        if cursor > 0.45:
+            times.append(round(cursor, 3))
+        if len(times) >= max_events:
+            break
+    return times
+
+
+def cut_whoosh_events(cut_times: list[float], offset: float = 0.0, label_prefix: str = "content_cut") -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    previous = -999.0
+    for index, cut_time in enumerate(cut_times):
+        event_time = max(0.0, offset + cut_time)
+        if event_time - previous < 0.65:
+            continue
+        previous = event_time
+        events.append({
+            "asset": "rapid_cut_whoosh",
+            "time": round(event_time, 3),
+            "volume": cfg_float("audio", "content_cut_whoosh_volume", 0.78),
+            "duration": cfg_float("audio", "content_cut_whoosh_duration", 0.34),
+            "label": f"{label_prefix}_{index + 1}",
+        })
+    return events
+
+
 def cut_silences(input_path: Path, output_path: Path, job_dir: Path) -> int:
     silence = EDITING_PRESET.get("silence_cut", {})
     noise = str(silence.get("noise", "-28dB"))
@@ -1663,7 +1693,8 @@ def concat_videos(paths: list[Path], output_path: Path, job_dir: Path, step: str
 
 
 def logo_overlay_y_expression(fly_seconds: float) -> str:
-    return f"if(lt(t\\,{fly_seconds:.3f})\\,(H-h)/2+260*(1-t/{fly_seconds:.3f})\\,(H-h)/2)"
+    travel = cfg_int("logo", "fly_travel_px", 620)
+    return f"if(lt(t\\,{fly_seconds:.3f})\\,(H-h)/2+{travel}*(1-t/{fly_seconds:.3f})\\,(H-h)/2)"
 
 
 def create_logo_reveal(job_dir: Path) -> tuple[Path | None, float]:
@@ -1677,19 +1708,19 @@ def create_logo_reveal(job_dir: Path) -> tuple[Path | None, float]:
         return None, 0.0
 
     reveal = job_dir / "logo_reveal.mp4"
-    reveal_duration = cfg_float("logo", "reveal_duration", 1.15)
+    reveal_duration = cfg_float("logo", "reveal_duration", 1.85)
     width = cfg_int("editing_preset", "width", int(EDITING_PRESET.get("normalize", {}).get("width", 1080)))
     height = cfg_int("editing_preset", "height", int(EDITING_PRESET.get("normalize", {}).get("height", 1920)))
     fps = cfg_int("editing_preset", "fps", int(EDITING_PRESET.get("normalize", {}).get("fps", 30)))
-    logo_width = cfg_int("logo", "width", 650)
+    logo_width = cfg_int("logo", "width", 820)
     background = str(cfg("logo", "background", "0xf5f8fb"))
-    fly_seconds = max(0.12, cfg_float("logo", "fly_seconds", 0.42))
+    fly_seconds = max(0.12, cfg_float("logo", "fly_seconds", 0.72))
     overlay_y = logo_overlay_y_expression(fly_seconds)
     filter_complex = (
         f"[1:v]format=rgba,scale={logo_width}:-1,"
-        "fade=t=in:st=0.04:d=0.16:alpha=1,split=2[logo][shadow_src];"
-        "[shadow_src]colorchannelmixer=rr=0:gg=0:bb=0:aa=0.24,boxblur=24:1[shadow];"
-        f"[0:v][shadow]overlay=x='(W-w)/2':y='{overlay_y}+26':format=auto[with_shadow];"
+        "fade=t=in:st=0.03:d=0.24:alpha=1,split=2[logo][shadow_src];"
+        "[shadow_src]colorchannelmixer=rr=0:gg=0:bb=0:aa=0.34,boxblur=34:1[shadow];"
+        f"[0:v][shadow]overlay=x='(W-w)/2':y='{overlay_y}+34':format=auto[with_shadow];"
         f"[with_shadow][logo]overlay=x='(W-w)/2':y='{overlay_y}':format=auto[v];"
         f"anullsrc=r=48000:cl=stereo,atrim=0:{reveal_duration:.3f}[a]"
     )
@@ -2020,7 +2051,7 @@ def build_intro_teaser(content_video: Path, words: list[dict[str, Any]], analysi
                 sfx_events.append({
                     "asset": "rapid_cut_whoosh",
                     "time": max(0.0, running + cfg_float("rapid_intro", "whoosh_after_cut_delay_seconds", 0.0)),
-                    "volume": cfg_float("audio", "rapid_cut_whoosh_volume", 0.18) * 2.0,
+                    "volume": cfg_float("audio", "rapid_cut_whoosh_volume", 0.42) * 2.0,
                     "duration": cfg_float("audio", "rapid_cut_whoosh_duration", 0.42),
                     "label": "rapid_cut_loud",
                 })
@@ -2165,6 +2196,47 @@ def generate_test_audio_assets(asset_dir: Path) -> dict[str, Any]:
     return manifest
 
 
+def first_existing_audio_path(key: str, configured_path: Path) -> Path:
+    brand_defaults = {
+        "intro_chime": [
+            Path("brand") / "soft-bell-ding-485895.mp3",
+            Path("brand") / "intro-sound-2-269294.mp3",
+        ],
+        "transition_whoosh": [
+            Path("brand") / "soundreality-whoosh-bamboo-389752.mp3",
+        ],
+        "rapid_cut_whoosh": [
+            Path("brand") / "soundreality-whoosh-bamboo-389752.mp3",
+        ],
+        "logo_whoosh": [
+            Path("brand") / "lordsonny-whoosh-cinematic-161021.mp3",
+        ],
+        "logo_reveal_chime": [
+            Path("brand") / "soft-bell-ding-485895.mp3",
+            Path("brand") / "intro-sound-2-269294.mp3",
+        ],
+        "music_bed": [
+            Path("brand") / "music_bed.mp3",
+            Path("brand") / "music_bed.wav",
+        ],
+    }
+    if configured_path.exists():
+        return configured_path
+
+    search_roots = [
+        AUDIO_ASSET_DIR,
+        PIPELINE_DIR / "audio",
+        PIPELINE_DIR / "defaults" / "audio",
+        Path(__file__).resolve().parent / "agentzero_pipeline_defaults" / "audio",
+    ]
+    for root in search_roots:
+        for relative in brand_defaults.get(key, []):
+            candidate = root / relative
+            if candidate.exists():
+                return candidate
+    return configured_path
+
+
 def resolve_audio_assets(job_dir: Path) -> dict[str, Any]:
     try:
         AUDIO_ASSET_DIR.mkdir(parents=True, exist_ok=True)
@@ -2179,6 +2251,7 @@ def resolve_audio_assets(job_dir: Path) -> dict[str, Any]:
         "logo_reveal_chime": Path(os.getenv("LOGO_REVEAL_CHIME_PATH", str(rebase_pipeline_path(cfg("audio", "logo_reveal_chime", AUDIO_ASSET_DIR / "logo_reveal_chime.wav"), AUDIO_ASSET_DIR / "logo_reveal_chime.wav")))),
         "music_bed": Path(os.getenv("MUSIC_BED_PATH", str(rebase_pipeline_path(cfg("audio", "music_bed", AUDIO_ASSET_DIR / "music_bed.wav"), AUDIO_ASSET_DIR / "music_bed.wav")))),
     }
+    configured = {key: first_existing_audio_path(key, path) for key, path in configured.items()}
     required = {"intro_chime", "transition_whoosh", "music_bed"}
     if not all(configured[key].exists() for key in required):
         generated = generate_test_audio_assets(job_dir / "generated_audio_assets")
@@ -2509,6 +2582,17 @@ def main() -> int:
 
         normalize_video(raw_input, normalized)
         cut_count = cut_silences(normalized, edited, job_dir)
+        content_cut_times: list[float] = []
+        try:
+            segment_data = json.loads((job_dir / "segments.json").read_text(encoding="utf-8"))
+            segment_pairs = [
+                (float(item[0]), float(item[1]))
+                for item in segment_data.get("segments", [])
+                if isinstance(item, (list, tuple)) and len(item) == 2
+            ]
+            content_cut_times = segment_boundary_times(segment_pairs)
+        except Exception:
+            content_cut_times = []
         captions, words = transcribe_and_write_captions(edited, job_dir)
         content_video = edited
         content_words = words
@@ -2534,6 +2618,7 @@ def main() -> int:
                 save_json(job_dir / "words_remapped.json", remapped_words)
                 content_video = word_gap_cut
                 content_words = remapped_words
+                content_cut_times = segment_boundary_times(gap_segments)
                 write_status(word_gap_cut=str(word_gap_cut), cut_count=cut_count)
 
         content_duration = ffprobe_duration(content_video)
@@ -2548,25 +2633,57 @@ def main() -> int:
         save_json(job_dir / "transcript_analysis.json", analysis)
 
         interrupt_intro = build_logo_interrupt_intro(content_video, content_words, job_dir)
+        resume_start_for_cut_sfx = 0.0
+        intro_mode_for_cut_sfx = "none"
         if interrupt_intro:
             interrupt_video, final_caption_words, teaser_duration, sfx_events, interrupt_manifest = interrupt_intro
             shutil.copy2(interrupt_video, assembled)
             nuggets = interrupt_manifest.get("opening_nuggets", [])
+            resume_start_for_cut_sfx = float(interrupt_manifest.get("resume_start", 0.0) or 0.0)
+            intro_mode_for_cut_sfx = str(interrupt_manifest.get("mode", "logo_interrupt_intro"))
         else:
             listicle_intro = build_listicle_logo_intro(content_video, content_words, job_dir)
             if listicle_intro:
                 listicle_video, final_caption_words, teaser_duration, sfx_events, listicle_manifest = listicle_intro
                 shutil.copy2(listicle_video, assembled)
                 nuggets = [listicle_manifest.get("hook", {})]
+                resume_start_for_cut_sfx = float(listicle_manifest.get("resume_start", 0.0) or 0.0)
+                intro_mode_for_cut_sfx = str(listicle_manifest.get("mode", "listicle_logo_intro"))
             else:
                 teaser, teaser_words, teaser_duration, nuggets, sfx_events = build_intro_teaser(content_video, content_words, analysis, job_dir)
                 if teaser_words and teaser != content_video:
                     concat_intro_and_main(teaser, content_video, assembled, job_dir)
                     final_caption_words = teaser_words + shift_words(content_words, teaser_duration)
+                    intro_mode_for_cut_sfx = "teaser_plus_full_content"
                 else:
                     shutil.copy2(content_video, assembled)
                     teaser_duration = 0.0
                     final_caption_words = content_words
+                    intro_mode_for_cut_sfx = "content_only"
+
+        if content_cut_times:
+            if resume_start_for_cut_sfx > 0:
+                cut_times_for_final_main = [
+                    round(cut_time - resume_start_for_cut_sfx, 3)
+                    for cut_time in content_cut_times
+                    if cut_time > resume_start_for_cut_sfx + 0.25
+                ]
+            else:
+                cut_times_for_final_main = content_cut_times
+            body_cut_events = cut_whoosh_events(
+                cut_times_for_final_main,
+                offset=teaser_duration,
+                label_prefix="body_cut",
+            )
+            sfx_events = list(sfx_events or []) + body_cut_events
+            save_json(job_dir / "cut_whoosh_plan.json", {
+                "intro_mode": intro_mode_for_cut_sfx,
+                "raw_content_cut_times": content_cut_times,
+                "resume_start": resume_start_for_cut_sfx,
+                "final_main_cut_times": cut_times_for_final_main,
+                "offset": teaser_duration,
+                "events": body_cut_events,
+            })
 
         assets = resolve_audio_assets(job_dir)
         mix_audio_bed(assembled, mixed, assets, teaser_duration, sfx_events)
