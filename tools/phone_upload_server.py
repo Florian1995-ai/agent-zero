@@ -28,6 +28,7 @@ PIPELINE_DIR = Path(os.getenv("AGENTZERO_PIPELINE_DIR", "/app/work_dir/assets/ag
 PIPELINE_CONFIG = Path(os.getenv("AGENTZERO_PIPELINE_CONFIG", str(PIPELINE_DIR / "pipeline_config.json")))
 RENDER_STATUS_FILE = OUTPUT_ROOT / "render_status.json"
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm"}
+PARTIAL_SUFFIXES = {".part", ".tmp", ".download", ".crdownload"}
 render_process: subprocess.Popen | None = None
 
 
@@ -41,6 +42,15 @@ def safe_filename(filename: str) -> str:
     clean_stem = "".join(ch if ch.isalnum() else "-" for ch in stem).strip("-") or "upload"
     timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     return f"{timestamp}-{clean_stem[:64]}{suffix}"
+
+
+def safe_upload_id(value: str) -> str:
+    clean = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in value or "").strip("-_")
+    return clean[:96] or datetime.utcnow().strftime("%Y%m%d%H%M%S")
+
+
+def upload_chunk_root(upload_id: str) -> Path:
+    return UPLOAD_DIR / ".partial" / safe_upload_id(upload_id)
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -72,6 +82,10 @@ def list_uploads() -> str:
     rows = []
     for path in sorted(UPLOAD_DIR.iterdir(), key=lambda item: item.stat().st_mtime, reverse=True)[:20]:
         if not path.is_file():
+            continue
+        if path.name.startswith(".") or path.suffix.lower() not in ALLOWED_EXTENSIONS:
+            continue
+        if any(path.name.endswith(suffix) for suffix in PARTIAL_SUFFIXES):
             continue
         size_mb = path.stat().st_size / (1024 * 1024)
         quoted_name = html.escape(quote(path.name))
@@ -368,7 +382,74 @@ Max RSS MB: {render_rss}</div>
       status.className = "status" + (kind ? " " + kind : "");
     }}
 
-    form.addEventListener("submit", (event) => {{
+    function postChunk(file, uploadId, index, totalChunks, chunkSize) {{
+      const start = index * chunkSize;
+      const end = Math.min(file.size, start + chunkSize);
+      const blob = file.slice(start, end);
+      const url = "/upload-chunk"
+        + "?upload_id=" + encodeURIComponent(uploadId)
+        + "&filename=" + encodeURIComponent(file.name)
+        + "&index=" + encodeURIComponent(index)
+        + "&total=" + encodeURIComponent(totalChunks)
+        + "&size=" + encodeURIComponent(file.size);
+
+      return new Promise((resolve, reject) => {{
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", url, true);
+        xhr.setRequestHeader("Content-Type", "application/octet-stream");
+        xhr.upload.addEventListener("progress", (event) => {{
+          if (event.lengthComputable) {{
+            const uploaded = start + event.loaded;
+            setProgress((uploaded / file.size) * 100, "Uploading chunk " + (index + 1) + "/" + totalChunks);
+          }}
+        }});
+        xhr.addEventListener("load", () => {{
+          if (xhr.status >= 200 && xhr.status < 300) {{
+            try {{
+              resolve(JSON.parse(xhr.responseText));
+            }} catch (_err) {{
+              resolve({{ ok: true }});
+            }}
+          }} else {{
+            reject(new Error("chunk " + (index + 1) + " failed with status " + xhr.status));
+          }}
+        }});
+        xhr.addEventListener("error", () => reject(new Error("network error on chunk " + (index + 1))));
+        xhr.addEventListener("abort", () => reject(new Error("upload cancelled")));
+        xhr.send(blob);
+      }});
+    }}
+
+    async function postChunkWithRetry(file, uploadId, index, totalChunks, chunkSize) {{
+      let lastError = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {{
+        try {{
+          if (attempt > 1) {{
+            setStatus("Retrying chunk " + (index + 1) + " (attempt " + attempt + "/3)...", "");
+          }}
+          return await postChunk(file, uploadId, index, totalChunks, chunkSize);
+        }} catch (err) {{
+          lastError = err;
+          await new Promise((resolve) => setTimeout(resolve, 900 * attempt));
+        }}
+      }}
+      throw lastError || new Error("chunk upload failed");
+    }}
+
+    async function uploadFileInChunks(file) {{
+      const chunkSize = 8 * 1024 * 1024;
+      const totalChunks = Math.max(1, Math.ceil(file.size / chunkSize));
+      const uploadId = Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
+      let finalResponse = null;
+      for (let index = 0; index < totalChunks; index++) {{
+        finalResponse = await postChunkWithRetry(file, uploadId, index, totalChunks, chunkSize);
+        const uploaded = Math.min(file.size, (index + 1) * chunkSize);
+        setProgress((uploaded / file.size) * 100, finalResponse.complete ? "Assembled" : "Uploaded chunk " + (index + 1) + "/" + totalChunks);
+      }}
+      return finalResponse || {{ ok: false }};
+    }}
+
+    form.addEventListener("submit", async (event) => {{
       event.preventDefault();
       if (!input.files || input.files.length === 0) {{
         setStatus("Choose a video first.", "error");
@@ -376,58 +457,25 @@ Max RSS MB: {render_rss}</div>
       }}
 
       const file = input.files[0];
-      const formData = new FormData();
-      formData.append("video", file);
-
-      const xhr = new XMLHttpRequest();
-      xhr.open("POST", window.location.href, true);
-      xhr.setRequestHeader("X-Requested-With", "XMLHttpRequest");
 
       button.disabled = true;
       input.disabled = true;
       setProgress(0, "Uploading");
-      setStatus(file.name + " selected. Keep this page open.", "");
+      setStatus(file.name + " selected. Keep this page open until it says saved.", "");
 
-      xhr.upload.addEventListener("progress", (event) => {{
-        if (event.lengthComputable) {{
-          setProgress((event.loaded / event.total) * 100, "Uploading");
-        }} else {{
-          progressWrap.style.display = "block";
-          progressLabel.textContent = "Uploading";
-          progressPercent.textContent = "Working...";
+      try {{
+        const data = await uploadFileInChunks(file);
+        if (!data.ok || !data.complete) {{
+          throw new Error(data.error || "upload did not complete");
         }}
-      }});
-
-      xhr.addEventListener("load", () => {{
-        if (xhr.status >= 200 && xhr.status < 300) {{
-          setProgress(100, "Uploaded");
-          try {{
-            const data = JSON.parse(xhr.responseText);
-            setStatus("Saved as " + data.filename + " (" + data.size_mb + " MB). Refreshing list...", "ok");
-          }} catch (_err) {{
-            setStatus("Upload complete. Refreshing list...", "ok");
-          }}
-          window.setTimeout(() => window.location.reload(), 1200);
-        }} else {{
-          setStatus("Upload failed with status " + xhr.status + ".", "error");
-          button.disabled = false;
-          input.disabled = false;
-        }}
-      }});
-
-      xhr.addEventListener("error", () => {{
-        setStatus("Upload failed. Check connection and try again.", "error");
+        setProgress(100, "Uploaded");
+        setStatus("Saved as " + data.filename + " (" + data.size_mb + " MB). Refreshing list...", "ok");
+        window.setTimeout(() => window.location.reload(), 1200);
+      }} catch (err) {{
+        setStatus("Upload failed: " + (err && err.message ? err.message : "check connection and try again."), "error");
         button.disabled = false;
         input.disabled = false;
-      }});
-
-      xhr.addEventListener("abort", () => {{
-        setStatus("Upload cancelled.", "error");
-        button.disabled = false;
-        input.disabled = false;
-      }});
-
-      xhr.send(formData);
+      }}
     }});
 
     function renderStatusText(data) {{
@@ -587,6 +635,9 @@ class Handler(BaseHTTPRequestHandler):
             filename = query.get("file", [""])[0]
             self.start_render(filename)
             return
+        if path == "/upload-chunk":
+            self.handle_upload_chunk()
+            return
 
         content_type = self.headers.get("content-type", "")
         if not content_type.startswith("multipart/form-data"):
@@ -633,6 +684,114 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(303)
         self.send_header("Location", f"/?uploaded={quote(filename)}")
         self.end_headers()
+
+    def handle_upload_chunk(self) -> None:
+        query = parse_qs(urlparse(self.path).query)
+        upload_id = safe_upload_id(query.get("upload_id", [""])[0])
+        original_name = Path(unquote(query.get("filename", ["upload.mov"])[0])).name
+        try:
+            index = int(query.get("index", [""])[0])
+            total = int(query.get("total", [""])[0])
+            expected_size = int(query.get("size", [""])[0])
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            self.send_json({"ok": False, "error": "Invalid chunk metadata"}, 400)
+            return
+        if total <= 0 or index < 0 or index >= total or expected_size <= 0 or content_length <= 0:
+            self.send_json({"ok": False, "error": "Invalid chunk bounds"}, 400)
+            return
+        if Path(original_name).suffix.lower() not in ALLOWED_EXTENSIONS:
+            self.send_json({"ok": False, "error": "Unsupported upload extension"}, 400)
+            return
+
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        root = upload_chunk_root(upload_id)
+        chunks_dir = root / "chunks"
+        chunks_dir.mkdir(parents=True, exist_ok=True)
+        meta_path = root / "meta.json"
+
+        if index == 0 and not meta_path.exists():
+            meta = {
+                "upload_id": upload_id,
+                "original_name": original_name,
+                "filename": safe_filename(original_name),
+                "expected_size": expected_size,
+                "total": total,
+                "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            }
+            meta_path.write_text(json.dumps(meta, ensure_ascii=True, indent=2), encoding="utf-8")
+        if not meta_path.exists():
+            self.send_json({"ok": False, "error": "Upload session missing; restart upload"}, 409)
+            return
+
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            self.send_json({"ok": False, "error": "Upload session metadata is invalid"}, 409)
+            return
+        if int(meta.get("expected_size", -1)) != expected_size or int(meta.get("total", -1)) != total:
+            self.send_json({"ok": False, "error": "Upload metadata mismatch; restart upload"}, 409)
+            return
+
+        chunk_path = chunks_dir / f"{index:06d}.chunk"
+        chunk_tmp = chunks_dir / f"{index:06d}.chunk.tmp"
+        remaining = content_length
+        with chunk_tmp.open("wb") as out_file:
+            while remaining > 0:
+                data = self.rfile.read(min(1024 * 1024, remaining))
+                if not data:
+                    break
+                out_file.write(data)
+                remaining -= len(data)
+        actual_size = chunk_tmp.stat().st_size
+        if actual_size != content_length:
+            try:
+                chunk_tmp.unlink()
+            except FileNotFoundError:
+                pass
+            self.send_json({"ok": False, "error": f"Chunk size mismatch: got {actual_size}, expected {content_length}"}, 400)
+            return
+        chunk_tmp.replace(chunk_path)
+
+        chunk_paths = [chunks_dir / f"{item:06d}.chunk" for item in range(total)]
+        received = sum(path.stat().st_size for path in chunk_paths if path.exists())
+        complete = all(path.exists() for path in chunk_paths)
+        if not complete:
+            self.send_json({
+                "ok": True,
+                "complete": False,
+                "received_bytes": received,
+                "expected_size": expected_size,
+                "chunk": index,
+                "total": total,
+            })
+            return
+
+        if received != expected_size:
+            self.send_json({"ok": False, "error": f"Final size mismatch: got {received}, expected {expected_size}"}, 409)
+            return
+
+        filename = str(meta.get("filename") or safe_filename(original_name))
+        destination = UPLOAD_DIR / filename
+        partial = UPLOAD_DIR / f"{filename}.part"
+        with partial.open("wb") as out_file:
+            for path in chunk_paths:
+                with path.open("rb") as in_file:
+                    shutil.copyfileobj(in_file, out_file, length=1024 * 1024)
+        if partial.stat().st_size != expected_size:
+            partial.unlink(missing_ok=True)
+            self.send_json({"ok": False, "error": "Assembled file size mismatch"}, 409)
+            return
+        partial.replace(destination)
+        shutil.rmtree(root, ignore_errors=True)
+        self.auto_start_render(filename)
+        self.send_json({
+            "ok": True,
+            "complete": True,
+            "filename": filename,
+            "size_mb": round(destination.stat().st_size / (1024 * 1024), 1),
+            "received_bytes": expected_size,
+        })
 
     def send_json(self, data: dict, status: int = 200) -> None:
         payload = json.dumps(data, ensure_ascii=True).encode("utf-8")
